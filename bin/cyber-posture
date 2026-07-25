@@ -141,6 +141,7 @@ def main() -> int:
     p_int.add_argument("--clam", nargs="*", default=None)
     p_int.add_argument("--quiet", action="store_true")
     p_int.add_argument("--update-baseline", action="store_true")
+    p_int.add_argument("--no-write", action="store_true")
 
     sub.add_parser("digest", help="short daily summary (stdout)")
     sub.add_parser("paths", help="show resolved state/config paths")
@@ -182,6 +183,8 @@ def main() -> int:
             argv.append("--quiet")
         if args.update_baseline:
             argv.append("--update-baseline")
+        if args.no_write:
+            argv.append("--no-write")
         argv.extend(unknown)
         return _run_module("scan_integrity.py", argv)
     return 1

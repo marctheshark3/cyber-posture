@@ -36,6 +36,39 @@ sudo ./scripts/install-malware-tools.sh
 cyber-posture integrity --deep --update-baseline
 ```
 
+
+## Docker
+
+Image: `ghcr.io/marctheshark3/cyber-posture` (multi-arch `amd64`/`arm64`).
+
+```bash
+# pull release
+docker pull ghcr.io/marctheshark3/cyber-posture:v1.0.0
+docker pull ghcr.io/marctheshark3/cyber-posture:latest
+
+# scan the *host* (not only the container)
+./scripts/docker-run-host.sh scan
+./scripts/docker-run-host.sh integrity --deep
+
+# compose
+docker compose run --rm cyber-posture scan
+```
+
+CI publishes:
+
+| Tag | When |
+|-----|------|
+| `edge` | every push to `main` |
+| `vX.Y.Z`, `latest` | git tag `v*` release workflow |
+| `sha-<short>` | every image build |
+
+Private GHCR: `echo $GH_TOKEN | docker login ghcr.io -u USER --password-stdin`
+
+## License
+
+- **Code:** MIT — [`LICENSE`](LICENSE)
+- **Third-party / image aggregate:** [`NOTICE.md`](NOTICE.md), [`docs/LICENSING.md`](docs/LICENSING.md)
+
 ## Multi-host profiles
 
 ```bash

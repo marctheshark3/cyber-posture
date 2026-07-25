@@ -1,0 +1,16 @@
+.git
+.github
+*.md
+!README.md
+!NOTICE.md
+!LICENSE
+docs
+cron
+examples
+state
+reports
+.venv
+__pycache__
+*.pyc
+.DS_Store
+cyber-pre-repo-backup*

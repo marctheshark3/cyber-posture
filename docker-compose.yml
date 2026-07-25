@@ -1,0 +1,28 @@
+# Optional compose for scheduled host scans (Linux Docker host).
+# Requires host network/pid for real host visibility.
+services:
+  cyber-posture:
+    image: ghcr.io/marctheshark3/cyber-posture:latest
+    build: .
+    network_mode: host
+    pid: host
+    # Uncomment for full integrity (ld.so.preload, package tools as root):
+    # user: "0:0"
+    volumes:
+      - cyber-state:/var/lib/cyber-posture
+      - ./config/profiles:/etc/cyber-posture/profiles:ro
+      - ${HOME}/.config/cyber-posture/config.yaml:/etc/cyber-posture/config.yaml:ro
+      # Host surfaces for integrity (read-only)
+      - /etc:/host/etc:ro
+      - /tmp:/tmp
+      - /var/tmp:/var/tmp
+      - /dev/shm:/dev/shm
+    environment:
+      CYBER_PROFILE: ${CYBER_PROFILE:-default}
+      CYBER_HUB_URL: ${CYBER_HUB_URL:-}
+      CYBER_TZ: ${CYBER_TZ:-America/New_York}
+      HOST_ROOT: /host
+    command: ["scan"]
+
+volumes:
+  cyber-state:

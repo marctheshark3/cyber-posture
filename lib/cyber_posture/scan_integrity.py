@@ -64,6 +64,14 @@ LAST_QUICK_PATH = HOST_DIR / "last-quick.json"
 BASELINE_PATH = HOST_DIR / "baseline.json"
 WIKI_MD = _REPORT_DIR / "host-integrity.md"
 
+
+def host_path(*parts: str) -> Path:
+    """Resolve path on scan target. HOST_ROOT=/host when running in Docker against host FS."""
+    root = Path(os.environ.get("HOST_ROOT") or "/")
+    if str(root) in ("", "/"):
+        return Path("/").joinpath(*parts)
+    return root.joinpath(*parts)
+
 # Paths ClamAV may hit on --clam default (user-writable risk surfaces)
 DEFAULT_CLAM_PATHS = [
     str(HOME / "Downloads"),
@@ -203,7 +211,7 @@ def tool_inventory() -> dict[str, Any]:
 
 
 def check_ld_preload(findings: list[Finding], checks: dict) -> None:
-    p = Path("/etc/ld.so.preload")
+    p = host_path("etc", "ld.so.preload")
     exists = p.exists()
     checks["ld_so_preload"] = {"exists": exists}
     if exists:
