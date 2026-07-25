@@ -1,0 +1,55 @@
+# Default portable profile — safe baselines for any Linux workstation/server.
+# Copy to ~/.config/cyber-posture/config.yaml and customize.
+# Or: cp config/profiles/spark-adb4.yaml ~/.config/cyber-posture/config.yaml
+
+name: default
+hub_url: ""   # optional link in reports, e.g. http://hostname:9093/security/cyber
+timezone: America/New_York
+
+# LAN ports considered expected when open (fingerprint policy)
+lan_allowlist:
+  - 22
+
+# Optional accepted wide binds (won't CRITICAL for being on 0.0.0.0 alone)
+accepted_lan_ports:
+  - 22
+
+# known TCP services: port -> metadata
+# expect_bind: loopback | lan | any | loopback_or_lan
+# auth: required | none | keyish | unknown | n/a | none-ok
+known_services:
+  22:
+    name: ssh
+    owner: system
+    expect_bind: any
+    auth: keyish
+    tier: control
+  53:
+    name: dns-local
+    owner: system
+    expect_bind: loopback
+    auth: n/a
+    tier: system
+  631:
+    name: cups
+    owner: system
+    expect_bind: loopback
+    auth: n/a
+    tier: system
+
+# HTTP probe paths for auth checks (only if port listening)
+probes:
+  80: ["/", "/health"]
+  443: ["/", "/health"]
+
+# integrity
+tmp_allow_prefixes:
+  - /tmp/.X11-unix
+  - /tmp/.ICE-unix
+  - /tmp/.font-unix
+
+clam_paths:
+  - ~/Downloads
+  - /tmp
+  - /var/tmp
+  - /dev/shm

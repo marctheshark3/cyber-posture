@@ -1,0 +1,72 @@
+# Profile: spark-adb4 (DGX Spark / House OS / Vigil / LLM)
+# Install: cp config/profiles/spark-adb4.yaml ~/.config/cyber-posture/config.yaml
+#    or:   export CYBER_PROFILE=spark-adb4
+
+name: spark-adb4
+hub_url: "http://spark-adb4:9093/security/cyber"
+timezone: America/New_York
+
+lan_allowlist: [22, 9093]
+accepted_lan_ports: [22, 9093]
+
+known_services:
+  22: {name: ssh, owner: system, expect_bind: any, auth: keyish, tier: control}
+  4000: {name: litellm, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  8093: {name: vllm-qwen36, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  8082: {name: ornith-optional, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  11434: {name: ollama, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  9093: {name: wiki-hub, owner: hub, expect_bind: lan, auth: required, tier: private-ui}
+  9091: {name: quartz-wiki-ui, owner: hub, expect_bind: loopback, auth: required, tier: private-ui}
+  9092: {name: neuralyogi-static, owner: publicish, expect_bind: loopback, auth: none-ok, tier: static}
+  9090: {name: llm-benchmark-dash, owner: dev, expect_bind: loopback, auth: required, tier: dev}
+  3333: {name: fine-tuning-workbench, owner: dev, expect_bind: loopback, auth: required, tier: dev}
+  8766: {name: cam0-yolo-ui, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  8767: {name: cam1-yolo-ui, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  8768: {name: cam-pilot-yolo-ui, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  1984: {name: go2rtc-api, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  8554: {name: go2rtc-rtsp, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  8555: {name: go2rtc-webrtc, owner: vigil, expect_bind: loopback, auth: required, tier: camera}
+  9500: {name: nerv-dashboard, owner: nerv, expect_bind: loopback, auth: required, tier: dev}
+  9510: {name: nerv-backend, owner: nerv, expect_bind: loopback, auth: required, tier: dev}
+  8792: {name: loopie-photo-gallery, owner: media, expect_bind: loopback, auth: required, tier: private-ui}
+  8793: {name: mosaic-generator, owner: media, expect_bind: loopback, auth: required, tier: dev}
+  8787: {name: python-ui-8787, owner: unknown, expect_bind: loopback, auth: required, tier: unknown}
+  13337: {name: code-server-or-node, owner: dev, expect_bind: loopback, auth: required, tier: dev}
+  11000: {name: dgx-dashboard-service, owner: nvidia-dgx, expect_bind: loopback, auth: unknown, tier: vendor}
+  37807: {name: dgx-dashboard-admin, owner: nvidia-dgx, expect_bind: loopback, auth: unknown, tier: vendor}
+  53: {name: dns-local, owner: system, expect_bind: loopback, auth: n/a, tier: system}
+  631: {name: cups, owner: system, expect_bind: loopback, auth: n/a, tier: system}
+
+probes:
+  4000: ["/v1/models", "/health/liveliness"]
+  8093: ["/v1/models", "/health"]
+  8082: ["/v1/models", "/health"]
+  11434: ["/api/tags"]
+  9093: ["/"]
+  9091: ["/"]
+  9092: ["/"]
+  9090: ["/"]
+  3333: ["/"]
+  8766: ["/", "/stream.mjpg"]
+  8767: ["/", "/stream.mjpg"]
+  8768: ["/", "/stream.mjpg"]
+  1984: ["/", "/api/streams"]
+  9500: ["/"]
+  9510: ["/", "/docs"]
+  8792: ["/"]
+  8793: ["/"]
+  8787: ["/"]
+
+tmp_allow_prefixes:
+  - /tmp/redroid-data/
+  - /tmp/.X11-unix
+  - /tmp/.ICE-unix
+  - /tmp/.font-unix
+  - /var/tmp/redroid
+
+clam_paths:
+  - ~/Downloads
+  - ~/.local/share/Trash
+  - /tmp
+  - /var/tmp
+  - /dev/shm

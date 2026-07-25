@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""cyber-posture — portable CLI for exposure + host integrity scanning.
+
+Usage:
+  cyber-posture scan                 # exposure + quick integrity
+  cyber-posture integrity            # quick IoCs
+  cyber-posture integrity --deep     # rkhunter/chkrootkit/debsums/clam if installed
+  cyber-posture integrity --clam
+  cyber-posture scan --quiet         # cron: silent unless fingerprint delta
+  cyber-posture scan --update-baseline
+  cyber-posture digest               # short daily summary
+  cyber-posture paths                # show resolved dirs
+  cyber-posture init-config          # seed ~/.config/cyber-posture/
+
+Env:
+  CYBER_PROFILE      profile name (default|spark-adb4|…)
+  CYBER_STATE_DIR    override state root
+  CYBER_REPORT_DIR   override HTML/MD output
+  CYBER_CONFIG_DIR   override config dir
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+from cyber_posture.paths import ensure_dirs, load_profile, resolve_paths  # noqa: E402
+
+
+def _run_module(script: str, argv: list[str]) -> int:
+    target = LIB / "cyber_posture" / script
+    cmd = [sys.executable, str(target), *argv]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    # inject resolved paths for child scanners
+    paths = resolve_paths()
+    ensure_dirs(paths)
+    env.setdefault("CYBER_STATE_DIR", str(paths["state"]))
+    env.setdefault("CYBER_REPORT_DIR", str(paths["report"]))
+    env.setdefault("CYBER_CONFIG_DIR", str(paths["config"]))
+    return subprocess.call(cmd, env=env)
+
+
+def cmd_paths(_: argparse.Namespace) -> int:
+    p = resolve_paths()
+    ensure_dirs(p)
+    prof = load_profile()
+    print(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in p.items()}, indent=2))
+    print("profile_file:", prof.get("_profile_path", "(built-in defaults only)"))
+    print("profile_name:", prof.get("name", "?"))
+    return 0
+
+
+def cmd_init_config(args: argparse.Namespace) -> int:
+    paths = resolve_paths()
+    ensure_dirs(paths)
+    cfg_dir = paths["config"]
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    dest = cfg_dir / "config.yaml"
+    src_name = args.profile or os.environ.get("CYBER_PROFILE") or "default"
+    repo = paths["repo"]
+    candidates = [
+        repo / "config" / "profiles" / f"{src_name}.yaml",
+        repo / "config" / "default.yaml",
+    ]
+    src = next((c for c in candidates if c.is_file()), None)
+    if not src:
+        print("No profile template found", file=sys.stderr)
+        return 1
+    if dest.exists() and not args.force:
+        print(f"Already exists: {dest} (use --force)")
+        return 0
+    dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"Wrote {dest} from {src.name}")
+    print(f"State:  {paths['state']}")
+    print(f"Report: {paths['report']}")
+    return 0
+
+
+def cmd_digest(_: argparse.Namespace) -> int:
+    paths = resolve_paths()
+    state = paths["state"] / "last-scan.json"
+    # refresh quietly
+    _run_module("scan_exposure.py", ["--quiet"])
+    if not state.is_file():
+        print("cyber-posture: no scan state yet")
+        return 0
+    data = json.loads(state.read_text(encoding="utf-8"))
+    s = data.get("summary") or {}
+    c, h, m = s.get("CRITICAL", 0), s.get("HIGH", 0), s.get("MEDIUM", 0)
+    prof = load_profile()
+    hub = prof.get("hub_url") or ""
+    lines = [
+        "🛡️ **Cyber posture daily**",
+        f"`{data.get('host','?')}` · {data.get('ts','?')}",
+        f"CRITICAL **{c}** · HIGH **{h}** · MED {m} · fw `{data.get('ufw','?')}`",
+        f"fp `{data.get('fingerprint','?')}`",
+    ]
+    if hub:
+        lines.append(f"Hub: {hub}")
+    hi = data.get("host_integrity") or {}
+    if hi:
+        lines.append(
+            f"Host integrity: C{hi.get('summary',{}).get('CRITICAL', hi.get('critical',0))} "
+            f"/ H{hi.get('summary',{}).get('HIGH', hi.get('high',0))}"
+        )
+    order = {"CRITICAL": 0, "HIGH": 1}
+    top = sorted(
+        [f for f in data.get("findings") or [] if f.get("severity") in order],
+        key=lambda x: order.get(x.get("severity"), 9),
+    )[:5]
+    if top:
+        lines.append("")
+        for f in top:
+            port = f" :{f['port']}" if f.get("port") else ""
+            lines.append(f"- **{f.get('severity')}** {f.get('title','')}{port}")
+    print("\n".join(lines))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="cyber-posture", description=__doc__)
+    ap.add_argument("--profile", default=None, help="profile name (sets CYBER_PROFILE)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_scan = sub.add_parser("scan", help="network exposure + quick integrity")
+    p_scan.add_argument("--quiet", action="store_true")
+    p_scan.add_argument("--update-baseline", action="store_true")
+    p_scan.add_argument("--full", action="store_true")
+    p_scan.add_argument("--no-write", action="store_true")
+
+    p_int = sub.add_parser("integrity", help="host integrity / malware surface")
+    p_int.add_argument("--deep", action="store_true")
+    p_int.add_argument("--clam", nargs="*", default=None)
+    p_int.add_argument("--quiet", action="store_true")
+    p_int.add_argument("--update-baseline", action="store_true")
+
+    sub.add_parser("digest", help="short daily summary (stdout)")
+    sub.add_parser("paths", help="show resolved state/config paths")
+
+    p_init = sub.add_parser("init-config", help="seed user config from a profile")
+    p_init.add_argument("--profile", dest="profile", default=None)
+    p_init.add_argument("--force", action="store_true")
+
+    args, unknown = ap.parse_known_args()
+    if args.profile:
+        os.environ["CYBER_PROFILE"] = args.profile
+
+    if args.cmd == "paths":
+        return cmd_paths(args)
+    if args.cmd == "init-config":
+        return cmd_init_config(args)
+    if args.cmd == "digest":
+        return cmd_digest(args)
+    if args.cmd == "scan":
+        argv = []
+        if args.quiet:
+            argv.append("--quiet")
+        if args.update_baseline:
+            argv.append("--update-baseline")
+        if args.full:
+            argv.append("--full")
+        if args.no_write:
+            argv.append("--no-write")
+        argv.extend(unknown)
+        return _run_module("scan_exposure.py", argv)
+    if args.cmd == "integrity":
+        argv = []
+        if args.deep:
+            argv.append("--deep")
+        if args.clam is not None:
+            argv.append("--clam")
+            argv.extend(args.clam)
+        if args.quiet:
+            argv.append("--quiet")
+        if args.update_baseline:
+            argv.append("--update-baseline")
+        argv.extend(unknown)
+        return _run_module("scan_integrity.py", argv)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
