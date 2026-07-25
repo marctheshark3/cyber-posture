@@ -1,0 +1,48 @@
+# Default portable profile — safe baselines for any Linux workstation/server.
+# Customize: cp config/default.yaml ~/.config/cyber-posture/config.yaml
+# Lab example: cp config/profiles/example-lab.yaml ~/.config/cyber-posture/config.yaml
+
+name: default
+hub_url: ""
+timezone: UTC
+
+lan_allowlist:
+  - 22
+
+accepted_lan_ports:
+  - 22
+
+known_services:
+  22:
+    name: ssh
+    owner: system
+    expect_bind: any
+    auth: keyish
+    tier: control
+  53:
+    name: dns-local
+    owner: system
+    expect_bind: loopback
+    auth: n/a
+    tier: system
+  631:
+    name: cups
+    owner: system
+    expect_bind: loopback
+    auth: n/a
+    tier: system
+
+probes:
+  80: ["/", "/health"]
+  443: ["/", "/health"]
+
+tmp_allow_prefixes:
+  - /tmp/.X11-unix
+  - /tmp/.ICE-unix
+  - /tmp/.font-unix
+
+clam_paths:
+  - ~/Downloads
+  - /tmp
+  - /var/tmp
+  - /dev/shm

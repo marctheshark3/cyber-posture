@@ -1,0 +1,39 @@
+# Example profile: home/lab with local LLM + optional camera stack.
+# Copy: cp config/profiles/example-lab.yaml ~/.config/cyber-posture/config.yaml
+# Then edit ports to match YOUR services.
+
+name: example-lab
+hub_url: ""
+timezone: UTC
+
+lan_allowlist: [22]
+accepted_lan_ports: [22]
+
+known_services:
+  22: {name: ssh, owner: system, expect_bind: any, auth: keyish, tier: control}
+  4000: {name: llm-proxy, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  8080: {name: vllm-or-openai-compat, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  11434: {name: ollama, owner: llm, expect_bind: loopback, auth: required, tier: llm}
+  1984: {name: go2rtc-api, owner: camera, expect_bind: loopback, auth: required, tier: camera}
+  8554: {name: go2rtc-rtsp, owner: camera, expect_bind: loopback, auth: required, tier: camera}
+  8555: {name: go2rtc-webrtc, owner: camera, expect_bind: loopback, auth: required, tier: camera}
+  11000: {name: dgx-dashboard-service, owner: nvidia-dgx, expect_bind: loopback, auth: unknown, tier: vendor}
+  53: {name: dns-local, owner: system, expect_bind: loopback, auth: n/a, tier: system}
+  631: {name: cups, owner: system, expect_bind: loopback, auth: n/a, tier: system}
+
+probes:
+  4000: ["/v1/models", "/health", "/health/liveliness"]
+  8080: ["/v1/models", "/health"]
+  11434: ["/api/tags"]
+  1984: ["/", "/api/streams"]
+
+tmp_allow_prefixes:
+  - /tmp/.X11-unix
+  - /tmp/.ICE-unix
+  - /tmp/.font-unix
+
+clam_paths:
+  - ~/Downloads
+  - /tmp
+  - /var/tmp
+  - /dev/shm

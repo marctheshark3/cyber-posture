@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          python3 -m py_compile \
+            lib/cyber_posture/paths.py \
+            lib/cyber_posture/scan_exposure.py \
+            lib/cyber_posture/scan_integrity.py \
+            bin/cyber-posture
+
+      - name: CLI paths + scan --no-write
+        env:
+          CYBER_STATE_DIR: ${{ runner.temp }}/cyber-state
+          CYBER_REPORT_DIR: ${{ runner.temp }}/cyber-reports
+          CYBER_CONFIG_DIR: ${{ runner.temp }}/cyber-config
+        run: |
+          mkdir -p "$CYBER_STATE_DIR" "$CYBER_REPORT_DIR" "$CYBER_CONFIG_DIR"
+          cp config/default.yaml "$CYBER_CONFIG_DIR/config.yaml"
+          chmod +x bin/cyber-posture
+          ./bin/cyber-posture paths
+          ./bin/cyber-posture scan --no-write | head -40
+          ./bin/cyber-posture integrity --no-write 2>/dev/null || ./bin/cyber-posture integrity | head -30
+
+  docker:
+    name: Docker build (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: cyber-posture:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Container CLI smoke
+        run: |
+          docker run --rm cyber-posture:ci paths
+          docker run --rm cyber-posture:ci scan --no-write | head -40

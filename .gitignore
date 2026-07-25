@@ -1,0 +1,25 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local state & reports (never push scan dumps)
+.state/
+reports/
+*.json.bak
+
+# User secrets / machine local
+.env
+config/local.yaml
+config/local.yml
+.authorized_keys_snapshot
+
+# OS
+.DS_Store
+*.swp
+
+# IDE
+.idea/
+.vscode/
