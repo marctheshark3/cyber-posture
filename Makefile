@@ -12,14 +12,14 @@ install:
 
 test:
 	python3 -m py_compile lib/cyber_posture/*.py bin/cyber-posture
-	CYBER_STATE_DIR=/tmp/cyber-test-state CYBER_REPORT_DIR=/tmp/cyber-test-reports \
-	  ./bin/cyber-posture scan --no-write | head -20
+	python3 -m unittest discover -s tests -v
+	@for script in install.sh scripts/*.sh cron/*.sh; do bash -n "$$script" || exit; done
 
 docker:
 	docker build -t $(IMAGE) -t $(GHCR):$(VERSION) -t $(GHCR):local .
 
 docker-run:
-	IMAGE=$(IMAGE) ./scripts/docker-run-host.sh scan
+	CYBER_IMAGE=$(IMAGE) ./scripts/docker-run-host.sh scan
 
 release-dry:
 	@echo "Would tag v$(VERSION) and push → triggers Release workflow"

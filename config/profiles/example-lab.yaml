@@ -22,10 +22,16 @@ known_services:
   631: {name: cups, owner: system, expect_bind: loopback, auth: n/a, tier: system}
 
 probes:
-  4000: ["/v1/models", "/health", "/health/liveliness"]
-  8080: ["/v1/models", "/health"]
-  11434: ["/api/tags"]
-  1984: ["/", "/api/streams"]
+  4000:
+    - {path: /v1/models, auth: required}
+    - {path: /health/liveliness, auth: public}
+  8080:
+    - {path: /v1/models, auth: required}
+    - {path: /health, auth: public}
+  11434:
+    - {path: /api/tags, auth: required}
+  1984:
+    - {path: /api/streams, auth: required}
 
 tmp_allow_prefixes:
   - /tmp/.X11-unix

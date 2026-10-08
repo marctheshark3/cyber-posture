@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Install cyber-posture CLI for the current user.
 set -euo pipefail
+umask 077
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  echo "PyYAML is required for the bundled profiles. Install python3-yaml, then rerun." >&2
+  exit 2
+fi
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${CYBER_BIN_DIR:-$HOME/bin}"
 mkdir -p "$BIN_DIR"
@@ -28,7 +33,7 @@ if [[ "${1:-}" == "--link-scripts" ]]; then
   echo "Scripts linked → $LINK_DIR"
 fi
 
-"$BIN_DIR/cyber-posture" init-config --profile "$PROFILE" || true
+"$BIN_DIR/cyber-posture" init-config --profile "$PROFILE"
 echo
 echo "OK. Try:"
 echo "  cyber-posture paths"

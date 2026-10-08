@@ -12,7 +12,7 @@ Modes:
   --deep      also run rkhunter/chkrootkit if present; broader tmp walk
   --clam PATH run clamscan on PATH (or default high-risk dirs) when installed
   --update-baseline  accept current persistence hashes
-  --quiet     print Discord markdown only on HIGH+ delta vs baseline fp
+  --quiet     print alerts on HIGH+ changes, recovery, or daily reminders
   --json PATH write machine JSON (default state dir)
 
 Safe: no sudo required for core checks. Optional tools may need root for full
@@ -26,30 +26,28 @@ import json
 import os
 import re
 import shutil
-import socket
 import stat
 import subprocess
 import time
+import sys
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from cyber_posture.paths import host_root, load_profile, resolve_paths, target_hostname
+from cyber_posture.state import atomic_write, load_json, needs_alert, remember_alert, scan_lock
+
+PROFILE: dict[str, Any] = {}
+
+
 def _init_paths():
-    home = Path.home()
-    state = Path(os.environ.get("CYBER_STATE_DIR") or (home / ".local/state/cyber-posture")).expanduser()
-    report = Path(os.environ.get("CYBER_REPORT_DIR") or (state / "reports")).expanduser()
-    if os.environ.get("CYBER_ALLOW_HERMES") == "1":
-        _ho = home / "Documents/wiki/wiki/outputs/cyber-posture"
-        if _ho.is_dir() and not os.environ.get("CYBER_REPORT_DIR"):
-            report = _ho
-        _hs = home / ".hermes/profiles/tron/state/cyber-posture"
-        if _hs.is_dir() and not os.environ.get("CYBER_STATE_DIR"):
-            state = _hs
-    host = state / "host-integrity"
-    host.mkdir(parents=True, exist_ok=True)
-    report.mkdir(parents=True, exist_ok=True)
+    paths = resolve_paths()
+    state, host, report = paths["state"], paths["host_integrity"], paths["report"]
     tz_name = os.environ.get("CYBER_TZ", "America/New_York")
     try:
         tz = ZoneInfo(tz_name)
@@ -68,10 +66,7 @@ WIKI_MD = _REPORT_DIR / "host-integrity.md"
 
 def host_path(*parts: str) -> Path:
     """Resolve path on scan target. HOST_ROOT=/host when running in Docker against host FS."""
-    root = Path(os.environ.get("HOST_ROOT") or "/")
-    if str(root) in ("", "/"):
-        return Path("/").joinpath(*parts)
-    return root.joinpath(*parts)
+    return host_root().joinpath(*parts)
 
 # Paths ClamAV may hit on --clam default (user-writable risk surfaces)
 DEFAULT_CLAM_PATHS = [
@@ -125,6 +120,8 @@ class IntegrityResult:
     baselines: dict[str, Any] = field(default_factory=dict)
     checks: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+    coverage: dict[str, Any] = field(default_factory=dict)
+    complete: bool = True
 
 
 def run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
@@ -158,6 +155,8 @@ def sha256_file(path: Path, limit: int = 8_000_000) -> str | None:
                     break
                 h.update(chunk)
                 remaining -= len(chunk)
+            if f.read(1):
+                raise ValueError("File exceeds hashing limit")
         return h.hexdigest()
     except Exception:
         return None
@@ -172,18 +171,11 @@ def severity_counts(findings: list[Finding]) -> dict[str, int]:
 
 def fingerprint(findings: list[Finding]) -> str:
     parts = sorted(
-        f"{f.severity}:{f.code}:{f.title}"
+        f"{f.severity}:{f.code}:{f.title}:{f.detail}:{f.evidence}"
         for f in findings
         if f.severity in ("CRITICAL", "HIGH")
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 def tool_inventory() -> dict[str, Any]:
@@ -200,11 +192,6 @@ def tool_inventory() -> dict[str, Any]:
     ):
         p = which(name)
         tools[name] = {"present": bool(p), "path": p}
-    # clamd running?
-    if which("clamdscan"):
-        rc, out, _ = run(["clamdscan", "--version"], timeout=10)
-        tools["clamdscan"]["version_rc"] = rc
-        tools["clamd"] = {"reachable": rc == 0}
     return tools
 
 
@@ -235,29 +222,25 @@ def check_ld_preload(findings: list[Finding], checks: dict) -> None:
 
 
 def check_tmp_executables(findings: list[Finding], checks: dict, deep: bool) -> None:
-    roots = [Path("/tmp"), Path("/var/tmp"), Path("/dev/shm")]
-    # Common container/emulator + X11 harmless +x noise
-    allow_prefixes = (
-        "/tmp/redroid-data/",
-        "/tmp/.X11-unix",
-        "/tmp/.ICE-unix",
-        "/tmp/.font-unix",
-        "/var/tmp/redroid",
-    )
+    roots = [host_path("tmp"), host_path("var", "tmp"), host_path("dev", "shm")]
+    allow_prefixes = tuple(str(host_path(*Path(p).expanduser().parts[1:])) for p in PROFILE.get("tmp_allow_prefixes", []))
     hits: list[str] = []
     max_hits = 40 if deep else 15
 
     def is_interesting_exec(fp: Path, st: os.stat_result) -> bool:
         path_s = str(fp)
-        if any(path_s.startswith(p) or path_s == p.rstrip("/") for p in allow_prefixes):
+        if any(path_s == p.rstrip("/") or path_s.startswith(p.rstrip("/") + "/") for p in allow_prefixes):
             return False
         # prefer real payloads: ELF, shebang, or anything in shm
-        if path_s.startswith("/dev/shm/"):
+        if fp.is_relative_to(host_path("dev", "shm")):
             return True
         try:
             with fp.open("rb") as f:
                 head = f.read(256)
-        except Exception:
+        except PermissionError as exc:
+            checks.setdefault("tmp_read_errors", []).append(str(exc))
+            return False
+        except OSError:
             return False
         if head.startswith(b"\x7fELF"):
             return True
@@ -271,22 +254,26 @@ def check_tmp_executables(findings: list[Finding], checks: dict, deep: bool) -> 
 
     for root in roots:
         if not root.is_dir():
+            checks.setdefault("tmp_read_errors", []).append(f"Temporary surface is unavailable: {root}")
             continue
         try:
-            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=lambda exc: checks.setdefault("tmp_read_errors", []).append(str(exc))):
                 depth = Path(dirpath).relative_to(root).parts
                 if not deep and len(depth) > 3:
                     dirnames.clear()
                     continue
-                # prune redroid tree early unless deep
-                if not deep and any(str(Path(dirpath)).startswith(p.rstrip("/")) for p in allow_prefixes if p.endswith("/")):
+                # Honor directory boundaries: excluding /tmp/safe must not exclude /tmp/safe-malware.
+                if any(str(Path(dirpath)) == p.rstrip("/") or str(Path(dirpath)).startswith(p.rstrip("/") + "/") for p in allow_prefixes):
                     dirnames.clear()
                     continue
                 for name in filenames:
                     fp = Path(dirpath) / name
                     try:
                         st = fp.lstat()
-                    except Exception:
+                    except PermissionError as exc:
+                        checks.setdefault("tmp_read_errors", []).append(str(exc))
+                        continue
+                    except OSError:
                         continue
                     if not stat.S_ISREG(st.st_mode):
                         continue
@@ -299,7 +286,8 @@ def check_tmp_executables(findings: list[Finding], checks: dict, deep: bool) -> 
                         break
                 if len(hits) >= max_hits:
                     break
-        except PermissionError:
+        except PermissionError as exc:
+            checks.setdefault("tmp_read_errors", []).append(str(exc))
             continue
     checks["tmp_executables"] = {"count": len(hits), "samples": hits[:12]}
     if hits:
@@ -309,7 +297,7 @@ def check_tmp_executables(findings: list[Finding], checks: dict, deep: bool) -> 
                 sev,
                 "TMP_EXECUTABLES",
                 f"{len(hits)} executable payload(s) under tmp/shm",
-                "ELF/shebang/+x in tmp surfaces (redroid data excluded). Samples: "
+                "ELF/shebang/+x in scanned tmp surfaces. Samples: "
                 + "; ".join(hits[:6]),
                 remediation="Identify owner/process; quarantine unknowns; prefer noexec on /tmp if workflow allows.",
                 evidence="; ".join(hits[:8]),
@@ -338,8 +326,11 @@ def check_fake_kernel_procs(findings: list[Finding], checks: dict) -> None:
             exe = entry / "exe"
             try:
                 target = os.readlink(exe)
-            except Exception:
-                # no exe link — normal for kernel threads
+            except PermissionError as exc:
+                checks.setdefault("process_read_errors", []).append(str(exc))
+                continue
+            except OSError:
+                # A disappearing process or kernel thread has no userspace executable.
                 continue
             # userland process with kernel-ish name
             fakes.append(f"pid={entry.name} comm={comm} exe={target}")
@@ -367,14 +358,17 @@ def check_suspicious_cmdline(findings: list[Finding], checks: dict) -> None:
                 continue
             try:
                 raw = (entry / "cmdline").read_bytes()
-            except Exception:
+            except PermissionError as exc:
+                checks.setdefault("process_read_errors", []).append(str(exc))
+                continue
+            except OSError:
                 continue
             cmd = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
             if not cmd:
                 continue
             for rx in SUSPICIOUS_PROC_RES:
                 if rx.search(cmd):
-                    hits.append(f"pid={entry.name} {cmd[:160]}")
+                    hits.append(f"pid={entry.name} matched={rx.pattern}")
                     break
             if len(hits) >= 20:
                 break
@@ -401,8 +395,8 @@ def check_proc_ps_gap(findings: list[Finding], checks: dict) -> None:
         for entry in Path("/proc").iterdir():
             if entry.name.isdigit():
                 proc_pids.add(int(entry.name))
-    except Exception:
-        return
+    except OSError as exc:
+        raise RuntimeError(f"Cannot enumerate /proc: {exc}") from exc
     rc, out, _ = run(["ps", "-eo", "pid=", "--no-headers"], timeout=15)
     ps_pids = set()
     if rc == 0:
@@ -435,115 +429,123 @@ def check_proc_ps_gap(findings: list[Finding], checks: dict) -> None:
         )
 
 
+def file_snapshot(path: Path) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    result: dict[str, Any] = {"exists": True, "mode": stat.S_IMODE(metadata.st_mode),
+                              "uid": metadata.st_uid, "gid": metadata.st_gid}
+    if path.is_symlink():
+        result["link"] = os.readlink(path)
+        if not path.exists():
+            result["target_missing"] = True
+            return result
+    if path.is_dir():
+        result["kind"] = "directory"
+    elif path.is_file():
+        result["kind"] = "file"
+        result["sha256"] = sha256_file(path)
+        if result["sha256"] is None:
+            raise OSError(f"Cannot fully hash {path}")
+    else:
+        raise OSError(f"Unsupported persistence file type: {path}")
+    return result
+
+
 def check_ssh_keys(findings: list[Finding], checks: dict, baseline: dict) -> dict:
-    ak = HOME / ".ssh" / "authorized_keys"
-    data = {"path": str(ak), "exists": ak.exists()}
-    if ak.exists():
-        text = ak.read_text(encoding="utf-8", errors="replace")
-        # strip comments/blank for stable hash of keys only
-        keys = [
-            ln.strip()
-            for ln in text.splitlines()
-            if ln.strip() and not ln.strip().startswith("#")
-        ]
-        h = sha256_text("\n".join(keys))
-        data["key_count"] = len(keys)
-        data["hash"] = h
-        prev = (baseline.get("ssh_authorized_keys_hash") or "") if baseline else ""
-        if prev and prev != h:
-            findings.append(
-                Finding(
-                    "HIGH",
-                    "SSH_KEYS_CHANGED",
-                    "authorized_keys hash changed vs baseline",
-                    f"count={len(keys)} prev={prev[:12]}… now={h[:12]}… "
-                    "Persistence via extra SSH keys is a classic trojan path.",
-                    remediation="Diff keys; remove unknown; --update-baseline only after Marc review.",
-                    evidence=h,
-                )
-            )
-        elif not prev:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "SSH_KEYS_BASELINE_SEED",
-                    "authorized_keys baseline will be seeded",
-                    f"{len(keys)} key line(s). Accept with --update-baseline.",
-                )
-            )
-    checks["ssh_authorized_keys"] = data
-    return {"ssh_authorized_keys_hash": data.get("hash")}
+    path = HOME / ".ssh/authorized_keys"
+    snapshot = file_snapshot(path)
+    checks["ssh_authorized_keys"] = {"path": str(path), **snapshot}
+    previous = baseline.get("ssh_authorized_keys")
+    if previous is not None:
+        changed = previous != snapshot
+    elif "ssh_authorized_keys_hash" in baseline:
+        if not baseline["ssh_authorized_keys_hash"]:
+            changed = snapshot["exists"]
+        else:
+            # Legacy hashes do not cover ownership or permissions. Require an explicit migration.
+            changed = True
+    else:
+        changed = False
+        findings.append(Finding("INFO", "SSH_KEYS_BASELINE_MISSING", "SSH key baseline has not been approved",
+                                "Review current keys and use integrity --update-baseline."))
+    if changed:
+        findings.append(Finding("HIGH", "SSH_KEYS_CHANGED", "SSH authorized_keys persistence changed",
+                                f"exists={snapshot['exists']} sha256={snapshot.get('sha256')} mode={snapshot.get('mode')} uid={snapshot.get('uid')} gid={snapshot.get('gid')}",
+                                "Review additions, deletions, permissions and ownership before approving a new baseline."))
+    return {"ssh_authorized_keys": snapshot, "ssh_authorized_keys_hash": snapshot.get("sha256")}
 
 
 def check_user_crontab(findings: list[Finding], checks: dict, baseline: dict) -> dict:
     rc, out, err = run(["crontab", "-l"], timeout=10)
-    text = out if rc == 0 else ""
-    if rc != 0 and "no crontab" not in (err + out).lower():
-        text = out + err
-    # drop comments
-    body = "\n".join(
-        ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")
-    )
-    h = sha256_text(body) if body else ""
-    data = {"empty": not body, "hash": h, "lines": body.count("\n") + (1 if body else 0)}
-    checks["user_crontab"] = data
-    prev = (baseline.get("user_crontab_hash") or "") if baseline else ""
-    if prev and h and prev != h:
-        findings.append(
-            Finding(
-                "HIGH",
-                "CRONTAB_CHANGED",
-                "User crontab changed vs baseline",
-                f"prev={prev[:12]}… now={h[:12]}… Worms/miners often add cron persistence.",
-                remediation="crontab -l and audit new jobs; --update-baseline after accept.",
-                evidence=body[:300],
-            )
-        )
-    elif body and not prev:
-        findings.append(
-            Finding(
-                "INFO",
-                "CRONTAB_BASELINE_SEED",
-                "User crontab baseline will be seeded",
-                f"{data['lines']} active line(s).",
-            )
-        )
-    return {"user_crontab_hash": h}
+    if rc != 0 and not (rc == 1 and "no crontab" in (out + err).lower()):
+        raise RuntimeError(f"Cannot read user crontab (rc={rc}): {err[:200]}")
+    body = "\n".join(line.strip() for line in out.splitlines() if line.strip() and not line.lstrip().startswith("#")) if rc == 0 else ""
+    digest = sha256_text(body)
+    snapshot = {"sha256": digest, "empty": not body}
+    checks["user_crontab"] = snapshot
+    if "user_crontab" in baseline:
+        changed = baseline["user_crontab"] != snapshot
+    elif "user_crontab_hash" in baseline:
+        changed = (baseline["user_crontab_hash"] or sha256_text("")) != digest
+    else:
+        changed = False
+        findings.append(Finding("INFO", "CRONTAB_BASELINE_MISSING", "Crontab baseline has not been approved",
+                                "Review current jobs and use integrity --update-baseline."))
+    if changed:
+        findings.append(Finding("HIGH", "CRONTAB_CHANGED", "User crontab persistence changed",
+                                f"empty={snapshot['empty']} sha256={digest}",
+                                "Inspect crontab -l and approve only intended changes; cron contents are omitted from reports."))
+    return {"user_crontab": snapshot, "user_crontab_hash": digest}
+
+
+def systemd_roots() -> list[Path]:
+    """Persistent user-unit locations, including XDG settings and data directories."""
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config").expanduser()
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share").expanduser()
+    if not config_home.is_absolute():
+        config_home = HOME / ".config"
+    if not data_home.is_absolute():
+        data_home = HOME / ".local/share"
+    roots = [config_home / "systemd/user", data_home / "systemd/user", config_home / "systemd/user.control",
+             Path("/etc/systemd/user"), Path("/usr/local/lib/systemd/user"), Path("/usr/lib/systemd/user")]
+    for variable, default in (("XDG_CONFIG_DIRS", "/etc/xdg"), ("XDG_DATA_DIRS", "/usr/local/share:/usr/share")):
+        roots.extend(Path(directory) / "systemd/user"
+                     for directory in (os.environ.get(variable) or default).split(":")
+                     if directory and Path(directory).is_absolute())
+    return list(dict.fromkeys(roots))
 
 
 def check_systemd_user(findings: list[Finding], checks: dict, baseline: dict) -> dict:
-    rc, out, _ = run(
-        ["systemctl", "--user", "list-unit-files", "--type=service", "--no-pager", "--no-legend"],
-        timeout=20,
-    )
-    units = []
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.split()
-            if parts:
-                units.append(parts[0])
-    units = sorted(set(units))
-    h = sha256_text("\n".join(units))
-    checks["systemd_user_units"] = {"count": len(units), "hash": h, "sample": units[:20]}
-    prev = (baseline.get("systemd_user_units_hash") or "") if baseline else ""
-    prev_list = set(baseline.get("systemd_user_units_list") or []) if baseline else set()
-    if prev and prev != h:
-        added = sorted(set(units) - prev_list) if prev_list else []
-        removed = sorted(prev_list - set(units)) if prev_list else []
-        findings.append(
-            Finding(
-                "HIGH" if added else "MEDIUM",
-                "SYSTEMD_USER_CHANGED",
-                "systemd --user unit set changed vs baseline",
-                f"n={len(units)} added={added[:8]} removed={removed[:8]}",
-                remediation="Inspect new units under ~/.config/systemd/user; disable unknowns.",
-                evidence=f"added={added[:10]}",
-            )
-        )
-    return {
-        "systemd_user_units_hash": h,
-        "systemd_user_units_list": units,
-    }
+    snapshots: dict[str, Any] = {}
+    for root in systemd_roots():
+        snapshots[str(root)] = file_snapshot(root)
+        if not root.is_dir():
+            continue
+        def walk_error(exc):
+            raise exc
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+            for name in sorted(files + [name for name in dirs if (Path(directory) / name).is_symlink()]):
+                path = Path(directory) / name
+                snapshots[str(path)] = file_snapshot(path)
+                if len(snapshots) > 10000:
+                    raise RuntimeError("Too many user systemd files to baseline safely")
+    digest = sha256_text(json.dumps(snapshots, sort_keys=True))
+    checks["systemd_user_units"] = {"count": len(snapshots), "hash": digest}
+    previous = baseline.get("systemd_user_files")
+    if previous is not None and previous != snapshots:
+        changed = sorted(path for path in previous.keys() | snapshots.keys() if previous.get(path) != snapshots.get(path))
+        findings.append(Finding("HIGH", "SYSTEMD_USER_CHANGED", "User systemd persistence changed",
+                                f"sha256={digest} changed={changed[:20]}",
+                                "Review unit contents, drop-ins, enablement links, ownership and permissions."))
+    elif previous is None and "systemd_user_units_hash" in baseline:
+        findings.append(Finding("HIGH", "SYSTEMD_USER_CHANGED", "Legacy systemd baseline needs content verification",
+                                "The old baseline tracked unit names only. Review files before approving the new baseline."))
+    elif previous is None:
+        findings.append(Finding("INFO", "SYSTEMD_BASELINE_MISSING", "User systemd baseline has not been approved",
+                                "Review unit files and enablement links before baselining."))
+    return {"systemd_user_files": snapshots, "systemd_user_units_hash": digest}
 
 
 def check_world_writable_path(findings: list[Finding], checks: dict) -> None:
@@ -577,13 +579,15 @@ def check_listening_unknown_high(findings: list[Finding], checks: dict) -> None:
     """Light complement: ESTABLISHED outbound to rare high ports — informational."""
     rc, out, _ = run(["ss", "-H", "-tn", "state", "established"], timeout=15)
     remote_ports: dict[int, int] = {}
+    if rc != 0:
+        raise RuntimeError(f"Cannot inspect established connections (rc={rc})")
     if rc == 0:
         for line in out.splitlines():
-            # Netid Recv-Q Send-Q Local Peer
+            # ss -H -tn state established emits Recv-Q Send-Q Local Peer
             parts = line.split()
-            if len(parts) < 5:
+            if len(parts) < 4:
                 continue
-            peer = parts[4]
+            peer = parts[-1]
             if ":" not in peer:
                 continue
             try:
@@ -613,240 +617,78 @@ def check_listening_unknown_high(findings: list[Finding], checks: dict) -> None:
         )
 
 
+def tool_failure(findings: list[Finding], name: str, rc: int, detail: str) -> None:
+    findings.append(Finding("HIGH", f"CHECK_FAILED_{name.upper()}", f"{name} scan did not complete",
+                            f"rc={rc}: {detail[:300]}", "Resolve missing permissions, signatures, or tool errors and rerun."))
+
+
 def run_optional_rootkit_tools(findings: list[Finding], checks: dict, deep: bool) -> None:
-    tools_ran = {}
-    if which("chkrootkit") and deep:
-        # chkrootkit is noisy; capture Infected / vulnerable lines
-        rc, out, err = run(["chkrootkit", "-q"], timeout=300)
-        text = out + err
-        tools_ran["chkrootkit"] = {"rc": rc, "bytes": len(text)}
-        bad_lines = [
-            ln
-            for ln in text.splitlines()
-            if re.search(r"(?i)infected|vulnerable|WARNING|not found", ln)
-            and not re.search(r"(?i)nothing found|not infected", ln)
-        ]
-        # filter common false positives lightly
-        bad_lines = [ln for ln in bad_lines if "PACKET SNIFFER" not in ln.upper()][:20]
-        if bad_lines:
-            findings.append(
-                Finding(
-                    "HIGH",
-                    "CHKROOTKIT_HIT",
-                    f"chkrootkit reported {len(bad_lines)} line(s)",
-                    "; ".join(bad_lines[:8]),
-                    remediation="Triage each line (many FPs); confirm with second tool + live USB.",
-                    evidence="; ".join(bad_lines[:10]),
-                )
-            )
-        elif rc in (0, 1):
-            findings.append(
-                Finding(
-                    "INFO",
-                    "CHKROOTKIT_OK",
-                    "chkrootkit quiet run clean-ish",
-                    f"rc={rc}",
-                )
-            )
-    elif deep and not which("chkrootkit"):
-        findings.append(
-            Finding(
-                "LOW",
-                "TOOL_MISSING_CHKROOTKIT",
-                "chkrootkit not installed",
-                "Install via scripts/install-malware-tools.sh for weekly deep scans.",
-            )
-        )
-
-    if which("rkhunter") and deep:
-        # --check --sk skip keypress; may need root for full
-        rc, out, err = run(
-            ["rkhunter", "--check", "--sk", "--nocolors", "--no-mail-on-warning"],
-            timeout=600,
-        )
-        text = out + err
-        tools_ran["rkhunter"] = {"rc": rc, "bytes": len(text)}
-        warns = [ln for ln in text.splitlines() if "Warning" in ln or "Infected" in ln][:30]
-        # summary line
-        summary_lines = [
-            ln
-            for ln in text.splitlines()
-            if re.search(r"(?i)suspect|possible rootkits|file properties", ln)
-        ][:10]
-        if warns:
-            findings.append(
-                Finding(
-                    "HIGH" if any("Infected" in w for w in warns) else "MEDIUM",
-                    "RKHUNTER_WARN",
-                    f"rkhunter {len(warns)} warning line(s)",
-                    "; ".join(warns[:8] + summary_lines[:3]),
-                    remediation="Run sudo rkhunter --check; update props with --propupd after legit upgrades.",
-                    evidence="; ".join(warns[:10]),
-                )
-            )
-        else:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "RKHUNTER_OK",
-                    "rkhunter completed without Warning lines",
-                    f"rc={rc} (user-level run may be partial without root)",
-                )
-            )
-    elif deep and not which("rkhunter"):
-        findings.append(
-            Finding(
-                "LOW",
-                "TOOL_MISSING_RKHUNTER",
-                "rkhunter not installed",
-                "Install via scripts/install-malware-tools.sh.",
-            )
-        )
-
-    if which("debsums") and deep:
-        rc, out, err = run(["debsums", "-s"], timeout=300)  # only silent failures = changed
+    if not deep:
+        return
+    checks["optional_tools"] = {}
+    commands = {
+        "chkrootkit": (["chkrootkit", "-q"], 300),
+        "rkhunter": (["rkhunter", "--check", "--sk", "--nocolors", "--no-mail-on-warning"], 600),
+        "debsums": (["debsums", "-s"], 300),
+    }
+    for name, (command, timeout) in commands.items():
+        if not which(name):
+            checks["optional_tools"][name] = {"status": "skipped", "reason": "Requested deep-scan tool is not installed"}
+            continue
+        rc, out, err = run(command, timeout=timeout)
         text = (out + err).strip()
-        tools_ran["debsums"] = {"rc": rc, "lines": len(text.splitlines()) if text else 0}
-        real_mismatch: list[str] = []
-        missing_vendor: list[str] = []
-        perm_noise: list[str] = []
-        vendor_re = re.compile(
-            r"(?i)(dgx-|nvidia|/opt/nvidia|/opt/dgx|cuda|nsight)",
-        )
-        for ln in text.splitlines() if text else []:
-            low = ln.lower()
-            s = ln.strip()
-            if not s:
-                continue
-            if "permission denied" in low or "can't open" in low or "cannot open" in low:
-                perm_noise.append(s[:200])
-            elif "missing file" in low and vendor_re.search(s):
-                missing_vendor.append(s[:200])
-            elif "missing file" in low:
-                # incomplete package; usually not malware — MEDIUM cluster
-                missing_vendor.append(s[:200])
-            else:
-                # actual checksum FAILED / differs
-                real_mismatch.append(s[:200])
-        tools_ran["debsums"]["mismatch_n"] = len(real_mismatch)
-        tools_ran["debsums"]["missing_n"] = len(missing_vendor)
-        tools_ran["debsums"]["perm_noise_n"] = len(perm_noise)
-        if real_mismatch:
-            findings.append(
-                Finding(
-                    "HIGH",
-                    "DEBSUMS_MISMATCH",
-                    f"debsums reports {len(real_mismatch)} checksum mismatch(es)",
-                    "; ".join(real_mismatch[:8]),
-                    remediation="Verify packages (apt install --reinstall pkg); if many system bins changed → compromise until proven otherwise.",
-                    evidence="; ".join(real_mismatch[:10]),
-                )
-            )
-        if missing_vendor and not real_mismatch:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "DEBSUMS_VENDOR_MISSING",
-                    f"debsums: {len(missing_vendor)} missing packaged file(s) (mostly NVIDIA/DGX)",
-                    "Incomplete vendor packages common on DGX images — not a malware IoC. Sample: "
-                    + "; ".join(missing_vendor[:5]),
-                    remediation="Ignore unless unexpected non-NVIDIA packages; optional reinstall dgx-oobe-desktop.",
-                    evidence="; ".join(missing_vendor[:8]),
-                )
-            )
-        elif missing_vendor and real_mismatch:
-            findings.append(
-                Finding(
-                    "LOW",
-                    "DEBSUMS_VENDOR_MISSING",
-                    f"also {len(missing_vendor)} missing vendor file(s)",
-                    "; ".join(missing_vendor[:4]),
-                )
-            )
-        if perm_noise and not real_mismatch and not missing_vendor:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "DEBSUMS_PERM_SKIP",
-                    f"debsums: {len(perm_noise)} unreadable path(s) as non-root (not mismatches)",
-                    "NVIDIA/dgx paths often root-only. Sample: " + "; ".join(perm_noise[:5]),
-                    remediation="Optional: sudo debsums -s for full coverage. Not a malware signal by itself.",
-                    evidence="; ".join(perm_noise[:8]),
-                )
-            )
-        if not real_mismatch and not missing_vendor and not perm_noise:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "DEBSUMS_OK",
-                    "debsums -s clean",
-                    "No silent checksum mismatches reported.",
-                )
-            )
-
-    checks["optional_tools"] = tools_ran
+        meta = checks["optional_tools"][name] = {"rc": rc, "status": "passed"}
+        if name == "debsums":
+            hits = [line for line in text.splitlines() if re.search(r"(?i)changed file|FAILED|checksum|missing file", line)]
+        else:
+            hits = [line for line in text.splitlines() if re.search(r"(?i)infected|vulnerable|warning", line)
+                    and not re.search(r"(?i)not infected|nothing found", line)]
+        if hits:
+            meta["status"] = "finding"
+            findings.append(Finding("HIGH", f"{name.upper()}_FINDING", f"{name} reported findings",
+                                    "; ".join(hits[:12]), "Review each finding; preserve evidence and investigate unexpected changes."))
+        failed = rc not in (0, 1, 2, 3) or (rc != 0 and not hits) or bool(re.search(r"(?i)permission denied|must be root|can't open|cannot open|error:", text))
+        if failed:
+            meta["status"] = "failed"
+            tool_failure(findings, name, rc, text or "No usable result")
+        elif not hits:
+            findings.append(Finding("INFO", f"{name.upper()}_OK", f"{name} completed without reported findings", "rc=0"))
 
 
-def run_clam(
-    findings: list[Finding], checks: dict, paths: list[str] | None
-) -> None:
+def run_clam(findings: list[Finding], checks: dict, paths: list[str] | None) -> None:
     clam = which("clamscan") or which("clamdscan")
     if not clam:
-        findings.append(
-            Finding(
-                "LOW",
-                "TOOL_MISSING_CLAMAV",
-                "ClamAV not installed",
-                "Signature AV optional but useful for Downloads/tmp. Install: sudo bash …/cyber-malware-tools-install.sh",
-            )
-        )
-        checks["clam"] = {"present": False}
+        checks["clam"] = {"status": "skipped", "reason": "Requested ClamAV scanner is not installed"}
         return
-    scan_paths = paths or [p for p in DEFAULT_CLAM_PATHS if Path(p).exists()]
+    requested = paths if paths else PROFILE.get("clam_paths", DEFAULT_CLAM_PATHS)
+    if host_root() != Path("/"):
+        requested = [str(host_path("tmp")), str(host_path("var", "tmp")), str(host_path("dev", "shm"))] if not paths else paths
+    scan_paths = [str(Path(path).expanduser()) for path in requested]
+    missing = [path for path in scan_paths if not Path(path).exists()]
+    scan_paths = [path for path in scan_paths if Path(path).exists()]
     if not scan_paths:
-        scan_paths = ["/tmp"]
-    cmd = [clam, "-r", "--bell", "--max-filesize=50M", "--max-scansize=200M"]
-    # clamdscan syntax slightly different
+        checks["clam"] = {"status": "failed", "reason": "No requested scan paths are accessible"}
+        tool_failure(findings, "clam", 2, "No requested scan paths are accessible")
+        return
+    cmd = [clam, "-r", "--max-filesize=50M", "--max-scansize=200M", "--fail-if-cvd-older-than=7"]
     if Path(clam).name == "clamdscan":
         cmd = [clam, "-m", "--fdpass"]
-    cmd.extend(scan_paths)
-    rc, out, err = run(cmd, timeout=900)
-    text = out + err
-    infected = []
-    for ln in text.splitlines():
-        if "FOUND" in ln and "OK" not in ln.split(":")[-1]:
-            infected.append(ln.strip()[:200])
-    summary = ""
-    for ln in text.splitlines():
-        if "Infected files" in ln:
-            summary = ln.strip()
-    checks["clam"] = {
-        "cmd": cmd[:6],
-        "rc": rc,
-        "infected_n": len(infected),
-        "summary": summary,
-        "paths": scan_paths,
-    }
-    if infected:
-        findings.append(
-            Finding(
-                "CRITICAL",
-                "CLAM_INFECTED",
-                f"ClamAV FOUND {len(infected)} infected file(s)",
-                "; ".join(infected[:8]) + (f" | {summary}" if summary else ""),
-                remediation="Quarantine/delete; re-scan; check how file arrived; rotate creds if executable payload.",
-                evidence="; ".join(infected[:10]),
-            )
-        )
-    else:
-        findings.append(
-            Finding(
-                "INFO",
-                "CLAM_CLEAN",
-                "ClamAV scan clean on scoped paths",
-                f"paths={scan_paths} rc={rc} {summary}",
-            )
-        )
+    rc, out, err = run([*cmd, "--", *scan_paths], timeout=900)
+    infected = [line.strip()[:200] for line in out.splitlines() if line.rstrip().endswith(" FOUND")]
+    scanned = re.search(r"Scanned files:\s*(\d+)", out)
+    checks["clam"] = {"rc": rc, "paths": scan_paths, "missing_paths": missing,
+                      "infected_n": len(infected), "status": "finding" if infected or rc == 1 else "passed"}
+    if infected or rc == 1:
+        findings.append(Finding("CRITICAL", "CLAM_INFECTED", "ClamAV reported infected files",
+                                "; ".join(infected[:10]) or "Scanner returned infection status (1).",
+                                "Preserve evidence, isolate affected files and investigate how they arrived."))
+    # Return code 2 is an error, and timeout is 124. Neither is a clean result.
+    if rc not in (0, 1) or (paths and missing) or (rc == 0 and (not scanned or int(scanned.group(1)) == 0)):
+        checks["clam"]["status"] = "failed"
+        tool_failure(findings, "clam", rc, err or f"Incomplete coverage; missing paths={missing}; scanned files={scanned.group(1) if scanned else 'unknown'}")
+    elif rc == 0 and not infected:
+        findings.append(Finding("INFO", "CLAM_CLEAN", "ClamAV completed without detections on scoped paths",
+                                f"paths={scan_paths}; {scanned.group(1)} files; size/archive limits apply."))
 
 
 def check_tools_absent_summary(findings: list[Finding], tools: dict) -> None:
@@ -871,51 +713,79 @@ def check_tools_absent_summary(findings: list[Finding], tools: dict) -> None:
 
 
 def scan(mode: str = "quick", clam_paths: list[str] | None = None) -> IntegrityResult:
-    t0 = time.time()
-    host = socket.gethostname() or "localhost"
+    global PROFILE
+    PROFILE = load_profile()
+    started = time.time()
     findings: list[Finding] = []
     checks: dict[str, Any] = {}
-    baseline = load_json(BASELINE_PATH) or {}
-    base_snap = baseline.get("baselines") or baseline  # tolerate shapes
+    coverage: dict[str, Any] = {}
+    baseline = load_json(BASELINE_PATH)
+    if BASELINE_PATH.exists() and baseline is None:
+        findings.append(Finding("HIGH", "BASELINE_UNREADABLE", "Integrity baseline cannot be read",
+                                "Restore the approved baseline; do not automatically trust current persistence."))
+    base = (baseline or {}).get("baselines", baseline or {})
+    if not isinstance(base, dict):
+        raise ValueError("Invalid integrity baseline structure")
+    snapshots: dict[str, Any] = {}
+    if not all(any(key in base for key in alternatives) for alternatives in (
+            ("ssh_authorized_keys", "ssh_authorized_keys_hash"),
+            ("user_crontab", "user_crontab_hash"),
+            ("systemd_user_files", "systemd_user_units_hash"))):
+        coverage["persistence_baseline"] = {"status": "skipped", "reason": "No complete approved persistence baseline; review current evidence before baselining."}
+
+    def check(name, function, *args):
+        count = len(findings)
+        try:
+            result = function(findings, checks, *args)
+            coverage[name] = {"status": "finding" if len(findings) > count else "passed"}
+            if isinstance(result, dict):
+                snapshots.update(result)
+        except Exception as exc:
+            coverage[name] = {"status": "failed", "reason": str(exc)[:300]}
+            tool_failure(findings, name, 2, str(exc))
 
     tools = tool_inventory()
-    check_ld_preload(findings, checks)
-    check_tmp_executables(findings, checks, deep=(mode == "deep"))
-    check_fake_kernel_procs(findings, checks)
-    check_suspicious_cmdline(findings, checks)
-    check_proc_ps_gap(findings, checks)
-    b1 = check_ssh_keys(findings, checks, base_snap)
-    b2 = check_user_crontab(findings, checks, base_snap)
-    b3 = check_systemd_user(findings, checks, base_snap)
-    check_world_writable_path(findings, checks)
-    check_listening_unknown_high(findings, checks)
+    host_container = host_root() != Path("/")
+    checks["target"] = {"scope": "mounted host surfaces" if host_container else "current user and readable system surfaces",
+                        "uid": os.geteuid(), "host_root": os.environ.get("HOST_ROOT", "/")}
+    if host_container and not host_path("etc").is_dir():
+        coverage["host_mounts"] = {"status": "failed", "reason": "The host /etc mount is missing; host evidence is unavailable."}
+    check("ld_preload", check_ld_preload)
+    check("tmp_executables", check_tmp_executables, mode == "deep")
+    check("kernel_processes", check_fake_kernel_procs)
+    check("process_commands", check_suspicious_cmdline)
+    check("process_inventory", check_proc_ps_gap)
+    if host_container:
+        for name in ("ssh_keys", "crontab", "systemd_user", "path", "host_packages"):
+            coverage[name] = {"status": "skipped", "reason": "Container environment is not the host's user/session/package database; run natively on the host."}
+    else:
+        check("ssh_keys", check_ssh_keys, base)
+        check("crontab", check_user_crontab, base)
+        check("systemd_user", check_systemd_user, base)
+        check("path", check_world_writable_path)
+    check("connections", check_listening_unknown_high)
     check_tools_absent_summary(findings, tools)
-
-    if mode == "deep":
-        run_optional_rootkit_tools(findings, checks, deep=True)
-    if clam_paths is not None or mode == "clam":
-        # clam_paths=[] means default paths; None + mode quick = skip
-        run_clam(findings, checks, clam_paths if clam_paths else None)
-    elif mode == "deep":
-        # deep also does a quick clam if available
-        if which("clamscan") or which("clamdscan"):
-            run_clam(findings, checks, None)
-
-    new_baselines = {**b1, **b2, **b3}
-    counts = severity_counts(findings)
-    fp = fingerprint(findings)
-    return IntegrityResult(
-        ts=datetime.now(TZ).strftime("%Y-%m-%d %H:%M %Z"),
-        host=host,
-        mode=mode,
-        findings=[asdict(f) for f in findings],
-        summary=counts,
-        fingerprint=fp,
-        tools=tools,
-        baselines=new_baselines,
-        checks=checks,
-        duration_s=round(time.time() - t0, 2),
-    )
+    if mode == "deep" and not host_container:
+        run_optional_rootkit_tools(findings, checks, True)
+        coverage.update(checks.get("optional_tools", {}))
+    if clam_paths is not None or mode in ("deep", "clam"):
+        run_clam(findings, checks, clam_paths)
+        coverage["clam"] = checks["clam"]
+    for key in ("fake_kernel_procs_error", "cmdline_error", "tmp_read_errors", "process_read_errors"):
+        if checks.get(key):
+            coverage[key] = {"status": "failed", "reason": "Some requested process/filesystem evidence could not be read."}
+    if checks.get("proc_ps", {}).get("skipped"):
+        coverage["process_inventory"] = {"status": "failed", "reason": "ps process inventory was unavailable"}
+    complete = baseline is not None or not BASELINE_PATH.exists()
+    complete = complete and not any(c["status"] in ("failed", "skipped") for c in coverage.values())
+    if not complete:
+        incomplete = sorted(name for name, meta in coverage.items() if meta["status"] in ("failed", "skipped"))
+        findings.append(Finding("HIGH", "INTEGRITY_INCOMPLETE", "Integrity scan coverage is incomplete",
+                                ", ".join(incomplete) or "Baseline unreadable", "Resolve failed checks; run host persistence/package checks natively."))
+    return IntegrityResult(ts=datetime.now(TZ).isoformat(timespec="seconds"), host=target_hostname(), mode=mode,
+                           findings=[asdict(f) for f in findings], summary=severity_counts(findings),
+                           fingerprint=fingerprint(findings), tools=tools, baselines=snapshots, checks=checks,
+                           duration_s=round(time.time() - started, 2), coverage=coverage, complete=complete)
 
 
 def to_markdown(result: IntegrityResult) -> str:
@@ -924,6 +794,8 @@ def to_markdown(result: IntegrityResult) -> str:
         "",
         f"- **When:** {result.ts}",
         f"- **Mode:** {result.mode}",
+        f"- **Complete:** {result.complete}",
+        f"- **Target:** {result.checks.get('target', {})}",
         f"- **Duration:** {result.duration_s}s",
         f"- **Fingerprint:** `{result.fingerprint}`",
         f"- **Summary:** C{result.summary.get('CRITICAL',0)} / H{result.summary.get('HIGH',0)} / "
@@ -935,6 +807,9 @@ def to_markdown(result: IntegrityResult) -> str:
     for name, meta in sorted((result.tools or {}).items()):
         if isinstance(meta, dict) and "present" in meta:
             lines.append(f"- `{name}`: {'yes' if meta.get('present') else 'no'}")
+    lines += ["", "## Coverage", ""]
+    for name, meta in result.coverage.items():
+        lines.append(f"- {name}: **{meta.get('status')}** {meta.get('reason', '')}")
     lines += ["", "## Findings", ""]
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     for f in sorted(result.findings, key=lambda x: (order.get(x.get("severity"), 9), x.get("code") or "")):
@@ -973,83 +848,56 @@ def discord_alert(result: IntegrityResult, prev_fp: str | None) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--deep", action="store_true", help="rootkit tools + broader walks")
-    ap.add_argument(
-        "--clam",
-        nargs="*",
-        default=None,
-        help="run ClamAV; optional paths (default high-risk dirs)",
-    )
+    ap.add_argument("--deep", action="store_true")
+    ap.add_argument("--clam", nargs="*", default=None)
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--update-baseline", action="store_true")
-    ap.add_argument("--json", type=Path, default=None)
-    ap.add_argument("--md", type=Path, default=None)
+    ap.add_argument("--json", type=Path)
+    ap.add_argument("--md", type=Path)
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args()
-
-    if args.deep:
-        mode = "deep"
-    elif args.clam is not None:
-        mode = "clam"
-    else:
-        mode = "quick"
-
-    HOST_DIR.mkdir(parents=True, exist_ok=True)
-    result = scan(mode=mode, clam_paths=args.clam if args.clam is not None else None)
-
-    json_path = args.json or LAST_PATH
-    md_path = args.md or WIKI_MD
-
-    if not args.no_write:
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = asdict(result)
-        raw = json.dumps(payload, indent=2)
-        json_path.write_text(raw, encoding="utf-8")
-        # always keep canonical latest + mode snapshot
-        if json_path.resolve() != LAST_PATH.resolve():
-            LAST_PATH.write_text(raw, encoding="utf-8")
-        if mode == "deep":
-            LAST_DEEP_PATH.write_text(raw, encoding="utf-8")
-        elif mode == "quick":
-            LAST_QUICK_PATH.write_text(raw, encoding="utf-8")
-        elif mode == "clam":
-            (HOST_DIR / "last-clam.json").write_text(raw, encoding="utf-8")
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.write_text(to_markdown(result), encoding="utf-8")
-        dated = md_path.parent / f"host-integrity-{datetime.now(TZ).strftime('%Y-%m-%d')}.md"
-        dated.write_text(to_markdown(result), encoding="utf-8")
-
-    if args.update_baseline:
-        BASELINE_PATH.write_text(
-            json.dumps(
-                {
-                    "ts": result.ts,
-                    "fingerprint": result.fingerprint,
-                    "baselines": result.baselines,
-                    "summary": result.summary,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    prev = load_json(BASELINE_PATH) or load_json(LAST_PATH)
-    prev_fp = (prev or {}).get("fingerprint")
-    crit = result.summary.get("CRITICAL", 0)
-    high = result.summary.get("HIGH", 0)
-    fp_changed = prev_fp is not None and prev_fp != result.fingerprint
-
-    if args.quiet:
-        if prev_fp is None or fp_changed or crit or (high and fp_changed):
-            # alert on new baseline missing, fp change; avoid spam if same HIGH debt
-            if prev_fp is None or fp_changed:
-                print(discord_alert(result, prev_fp))
-        return 0
-
-    print(to_markdown(result))
-    if crit or high:
-        print("\n---\n" + discord_alert(result, prev_fp))
-    return 0
+    if args.no_write and args.update_baseline:
+        ap.error("--no-write cannot be combined with --update-baseline")
+    mode = "deep" if args.deep else "clam" if args.clam is not None else "quick"
+    try:
+        with nullcontext() if args.no_write else scan_lock(HOST_DIR, "integrity"):
+            alert_path = HOST_DIR / f"last-alert-{mode}.json"
+            previous = load_json(alert_path)
+            result = scan(mode, args.clam)
+            if args.update_baseline:
+                persistence_ok = all(result.coverage.get(name, {}).get("status") in ("passed", "finding")
+                                     for name in ("ssh_keys", "crontab", "systemd_user"))
+                unsafe = any(f["severity"] in ("CRITICAL", "HIGH") and f["code"] not in
+                             ("SSH_KEYS_CHANGED", "CRONTAB_CHANGED", "SYSTEMD_USER_CHANGED", "INTEGRITY_INCOMPLETE") for f in result.findings)
+                if not persistence_ok or unsafe:
+                    raise ValueError("Refusing baseline: persistence checks failed/skipped or unresolved HIGH/CRITICAL non-drift findings exist")
+                atomic_write(BASELINE_PATH, json.dumps({"version": 2, "ts": result.ts, "baselines": result.baselines}, indent=2))
+                result.coverage["persistence_baseline"] = {"status": "passed", "reason": "Current persistence explicitly approved by --update-baseline"}
+                result.complete = not any(meta["status"] in ("failed", "skipped") for meta in result.coverage.values())
+                if result.complete:
+                    result.findings = [f for f in result.findings if f["code"] != "INTEGRITY_INCOMPLETE"]
+                native_findings = [Finding(**f) for f in result.findings]
+                result.summary = severity_counts(native_findings)
+                result.fingerprint = fingerprint(native_findings)
+            if not args.no_write:
+                raw = json.dumps(asdict(result), indent=2)
+                atomic_write(args.json or LAST_PATH, raw)
+                if args.json and args.json != LAST_PATH:
+                    atomic_write(LAST_PATH, raw)
+                atomic_write(HOST_DIR / f"last-{mode}.json", raw)
+                md = args.md or WIKI_MD
+                atomic_write(md, to_markdown(result))
+                atomic_write(md.parent / f"host-integrity-{datetime.now(TZ):%Y-%m-%d}.md", to_markdown(result))
+            if not args.quiet:
+                print(to_markdown(result))
+            if needs_alert(result, previous):
+                print(discord_alert(result, (previous or {}).get("fingerprint")))
+                if not args.no_write:
+                    remember_alert(alert_path, result)
+            return 0 if result.complete else 2
+    except Exception as exc:
+        print(f"cyber-posture integrity failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
