@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
+import shutil
+import sys
+from contextlib import nullcontext
 import json
 import os
 import re
-import socket
 import subprocess
 import urllib.error
 import urllib.request
@@ -21,21 +24,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from cyber_posture.paths import host_root, load_profile, resolve_paths, target_hostname, validate_profile
+from cyber_posture.state import atomic_write, load_json, needs_alert, remember_alert, scan_lock
+
+
 def _init_paths():
-    """Portable paths: env CYBER_* or XDG; Hermes wiki layout only if present."""
-    home = Path.home()
-    state = Path(os.environ.get("CYBER_STATE_DIR") or (home / ".local/state/cyber-posture")).expanduser()
-    report = Path(os.environ.get("CYBER_REPORT_DIR") or (state / "reports")).expanduser()
-    # Optional legacy layout (explicit opt-in only)
-    if os.environ.get("CYBER_ALLOW_HERMES") == "1":
-        hermes_out = home / "Documents/wiki/wiki/outputs/cyber-posture"
-        if hermes_out.is_dir() and not os.environ.get("CYBER_REPORT_DIR"):
-            report = hermes_out
-        hermes_state = home / ".hermes/profiles/tron/state/cyber-posture"
-        if hermes_state.is_dir() and not os.environ.get("CYBER_STATE_DIR"):
-            state = hermes_state
-    state.mkdir(parents=True, exist_ok=True)
-    report.mkdir(parents=True, exist_ok=True)
+    paths = resolve_paths()
+    state, report = paths["state"], paths["report"]
     tz_name = os.environ.get("CYBER_TZ", "America/New_York")
     try:
         tz = ZoneInfo(tz_name)
@@ -51,98 +48,31 @@ DEFAULT_MD = _REPORT_DIR / "latest.md"
 DEFAULT_HTML = _REPORT_DIR / "index.html"
 DEFAULT_JSON = STATE_DIR / "last-scan.json"
 
-# Minimal built-in known services. Extended via profile YAML (known_services / probes).
-KNOWN: dict[int, dict[str, str]] = {
-    22: {"name": "ssh", "owner": "system", "expect_bind": "any", "auth": "keyish", "tier": "control"},
-    53: {"name": "dns-local", "owner": "system", "expect_bind": "loopback", "auth": "n/a", "tier": "system"},
-    631: {"name": "cups", "owner": "system", "expect_bind": "loopback", "auth": "n/a", "tier": "system"},
-}
-
-# Probe paths — unauthenticated GET. 401/403 = auth present.
-PROBES: dict[int, list[str]] = {
-    80: ["/", "/health"],
-    443: ["/", "/health"],
-}
-
-LAN_ALLOWLIST: set[int] = {22}
-ACCEPTED_LAN_PORTS: set[int] = {22}
-PROFILE_NAME: str = "default"
-HUB_URL: str = ""
-
-
-def _coerce_port_map(raw: dict | None) -> dict[int, dict[str, str]]:
-    out: dict[int, dict[str, str]] = {}
-    if not isinstance(raw, dict):
-        return out
-    for k, v in raw.items():
-        try:
-            port = int(k)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(v, dict):
-            out[port] = {str(kk): str(vv) for kk, vv in v.items()}
-    return out
-
-
-def _coerce_probes(raw: dict | None) -> dict[int, list[str]]:
-    out: dict[int, list[str]] = {}
-    if not isinstance(raw, dict):
-        return out
-    for k, v in raw.items():
-        try:
-            port = int(k)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(v, list):
-            out[port] = [str(x) for x in v]
-        elif isinstance(v, str):
-            out[port] = [v]
-    return out
+KNOWN: dict[int, dict[str, str]] = {}
+PROBES: dict[int, list[dict[str, str]]] = {}
+LAN_ALLOWLIST: set[int] = set()
+ACCEPTED_LAN_PORTS: set[int] = set()
+TAILNET_IPS: set[str] = set()
+PROFILE_NAME = "default"
+HUB_URL = ""
 
 
 def apply_profile(profile: dict | None = None) -> None:
-    """Merge profile YAML into module-level KNOWN/PROBES/allowlists."""
     global KNOWN, PROBES, LAN_ALLOWLIST, ACCEPTED_LAN_PORTS, PROFILE_NAME, HUB_URL
-    if profile is None:
-        try:
-            from cyber_posture.paths import load_profile  # type: ignore
-
-            profile = load_profile()
-        except Exception:
-            try:
-                import sys
-                from pathlib import Path as _P
-
-                lib = _P(__file__).resolve().parent.parent
-                if str(lib) not in sys.path:
-                    sys.path.insert(0, str(lib))
-                from cyber_posture.paths import load_profile
-
-                profile = load_profile()
-            except Exception:
-                profile = {}
-    profile = profile or {}
-    PROFILE_NAME = str(profile.get("name") or os.environ.get("CYBER_PROFILE") or "default")
-    HUB_URL = str(profile.get("hub_url") or os.environ.get("CYBER_HUB_URL") or "")
-    base = dict(KNOWN)
-    base.update(_coerce_port_map(profile.get("known_services")))
-    KNOWN = base
-    probes = dict(PROBES)
-    probes.update(_coerce_probes(profile.get("probes")))
-    PROBES = probes
-    if profile.get("lan_allowlist"):
-        try:
-            LAN_ALLOWLIST = {int(x) for x in profile["lan_allowlist"]}
-        except Exception:
-            pass
-    if profile.get("accepted_lan_ports"):
-        try:
-            ACCEPTED_LAN_PORTS = {int(x) for x in profile["accepted_lan_ports"]}
-        except Exception:
-            pass
-
-
-apply_profile()
+    profile = validate_profile(load_profile() if profile is None else profile)
+    PROFILE_NAME = str(profile.get("name") or "default")
+    HUB_URL = os.environ.get("CYBER_HUB_URL") or str(profile.get("hub_url") or "")
+    KNOWN = {port: dict(meta) for port, meta in profile.get("known_services", {}).items()}
+    PROBES = {}
+    for port, probes in profile.get("probes", {}).items():
+        expected = "required" if KNOWN.get(port, {}).get("auth") == "required" else "observe"
+        PROBES[port] = [
+            {"scheme": "https" if port == 443 else "http", "auth": expected,
+             **({"path": probe} if isinstance(probe, str) else probe)}
+            for probe in probes
+        ]
+    LAN_ALLOWLIST = set(profile.get("lan_allowlist", []))
+    ACCEPTED_LAN_PORTS = set(profile.get("accepted_lan_ports", []))
 
 
 @dataclass
@@ -178,26 +108,32 @@ class ScanResult:
     summary: dict[str, int] = field(default_factory=dict)
     fingerprint: str = ""
     host_integrity: dict[str, Any] = field(default_factory=dict)
+    checks: dict[str, Any] = field(default_factory=dict)
+    complete: bool = True
 
 
-def run(cmd: list[str], timeout: int = 20) -> str:
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return (p.stdout or "") + (p.stderr or "")
-    except Exception as e:
-        return f"ERR:{e}"
+def run(cmd: list[str], timeout: int = 20, allow_failure: bool = False) -> str:
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode and not allow_failure:
+        raise RuntimeError(f"{cmd[0]} exited {p.returncode}: {(p.stderr or '')[:200]}")
+    return (p.stdout or "") + (p.stderr or "")
 
 
 def classify_bind(addr: str) -> str:
-    if addr in ("127.0.0.1", "::1", "127.0.0.53", "127.0.0.54"):
-        return "loopback"
-    if addr in ("0.0.0.0", "*", "::", "[::]"):
+    addr = addr.strip("[]").split("%")[0]
+    if addr == "*":
         return "lan_all"
-    if addr.startswith("100."):
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return "other"
+    if ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped and ip.ipv4_mapped.is_loopback):
+        return "loopback"
+    if ip.is_unspecified:
+        return "lan_all"
+    if addr in TAILNET_IPS:
         return "tailnet"
-    if addr.startswith("172.") or addr.startswith("192.168.") or addr.startswith("10."):
-        return "specific"
-    return "other"
+    return "specific"
 
 
 def parse_ss() -> list[Listener]:
@@ -218,26 +154,10 @@ def parse_ss() -> list[Listener]:
         m = re.search(r'users:\(\("([^"]+)"', line)
         if m:
             proc = m.group(1)
-        # handle [fe80::...]:546 and *:11434 and 127.0.0.53%lo:53
-        if local.count(":") >= 2 and local.startswith("["):
-            # [addr]:port
-            rm = re.match(r"\[([^\]]+)\]:(\d+)$", local)
-            if not rm:
-                continue
-            addr, port_s = rm.group(1), rm.group(2)
-        else:
-            # strip interface zone %lo
-            local_clean = local.split("%")[0] if "%" in local and "]" not in local else local
-            if local_clean.startswith("["):
-                rm = re.match(r"\[([^\]]+)\]:(\d+)$", local_clean)
-                if not rm:
-                    continue
-                addr, port_s = rm.group(1), rm.group(2)
-            else:
-                # 0.0.0.0:4000 or *:11434
-                if ":" not in local_clean:
-                    continue
-                addr, port_s = local_clean.rsplit(":", 1)
+        if ":" not in local:
+            continue
+        addr, port_s = local.rsplit(":", 1)
+        addr = addr.strip("[]")
         try:
             port = int(port_s)
         except ValueError:
@@ -255,27 +175,21 @@ def parse_ss() -> list[Listener]:
 
 
 def lan_and_tail_ips() -> tuple[list[str], list[str]]:
-    out = run(["ip", "-4", "-o", "addr", "show"])
-    lan, ts = [], []
+    out = run(["ip", "-o", "addr", "show"])
+    lan, tail = [], []
     for line in out.splitlines():
-        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/\d+", line)
-        if not m:
-            continue
-        ip = m.group(1)
-        # iface is field 1 in `ip -o` output: "2: wlP9s9    inet ..."
+        match = re.search(r"inet6? ([^ /]+)/\d+", line)
         parts = line.split()
-        iface = parts[1].rstrip(":") if len(parts) > 1 else ""
-        if ip.startswith("127."):
+        if not match or len(parts) < 2:
             continue
-        if iface.startswith("br-") or iface in ("docker0", "virbr0"):
+        addr, iface = match.group(1), parts[1].rstrip(":")
+        ip = ipaddress.ip_address(addr)
+        if ip.is_loopback or iface.startswith("br-") or iface in ("docker0", "virbr0"):
             continue
-        if ip.startswith("100."):
-            ts.append(ip)
-        elif iface.startswith("tailscale"):
-            ts.append(ip)
-        else:
-            lan.append(ip)
-    return sorted(set(lan)), sorted(set(ts))
+        if ip.version == 6 and ip.is_link_local:
+            addr += "%" + iface
+        (tail if iface.startswith("tailscale") else lan).append(addr)
+    return sorted(set(lan)), sorted(set(tail))
 
 
 def docker_ps() -> list[dict[str, str]]:
@@ -305,401 +219,122 @@ def docker_ps() -> list[dict[str, str]]:
     return rows
 
 
+def docker_listeners(rows: list[dict[str, str]]) -> list[Listener]:
+    """Include NAT publishes even when Docker's userland proxy is disabled."""
+    listeners = []
+    pattern = re.compile(r"(\[[^\]]+\]|[^\s,]+):(\d+)(?:-(\d+))?->\d+(?:-\d+)?/(tcp|udp)")
+    for row in rows:
+        for match in pattern.finditer(row.get("ports", "")):
+            addr, first, last, proto = match.groups()
+            addr = addr.strip("[]")
+            start, end = int(first), int(last or first)
+            if not 1 <= start <= end <= 65535 or end - start > 1024:
+                raise ValueError("Docker published port range is invalid or too large to inspect")
+            listeners.extend(Listener(proto, addr, port, classify_bind(addr), f"docker:{row['name']}")
+                             for port in range(start, end + 1))
+    return listeners
+
+
 def ufw_status() -> str:
     # non-root usually fails — try and classify
-    out = run(["ufw", "status", "verbose"])
+    out = run(["ufw", "status", "verbose"], allow_failure=True)
     if "Status: active" in out:
         return "active"
     if "Status: inactive" in out:
         return "inactive"
     if "need to be root" in out.lower() or "ERROR" in out:
-        # read conf
-        conf = Path("/etc/ufw/ufw.conf")
-        if conf.is_file():
-            txt = conf.read_text(errors="ignore")
-            if re.search(r"(?m)^ENABLED=yes", txt):
-                return "enabled-conf-unknown-runtime"
-            if re.search(r"(?m)^ENABLED=no", txt):
-                return "inactive"
         return "unknown-needs-root"
     return "unknown"
 
 
-def http_probe(port: int, path: str, timeout: float = 2.5) -> dict[str, Any]:
-    url = f"http://127.0.0.1:{port}{path}"
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_probe(port: int, path: str, timeout: float = 2.5,
+               host: str = "127.0.0.1", scheme: str | None = None) -> dict[str, Any]:
+    scheme = scheme or ("https" if port == 443 else "http")
+    target = f"[{host}]" if ":" in host else host
+    url = f"{scheme}://{target}:{port}{path}"
+    result = {"port": port, "path": path, "url": url, "host": host, "status": 0, "auth": "unknown"}
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "cyber-posture-scan/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read(200)
-            return {
-                "port": port,
-                "path": path,
-                "url": url,
-                "status": getattr(resp, "status", 200),
-                "auth": "none",
-                "bytes": len(body),
-                "snippet": body[:80].decode("utf-8", "replace"),
-            }
-    except urllib.error.HTTPError as e:
-        auth = "required" if e.code in (401, 403) else "none"
-        if e.code in (401, 403):
-            auth = "required"
-        elif e.code == 404:
-            auth = "unknown"
-        else:
-            auth = "none"
-        return {
-            "port": port,
-            "path": path,
-            "url": url,
-            "status": e.code,
-            "auth": auth,
-            "bytes": 0,
-            "snippet": str(e),
-        }
-    except Exception as e:
-        return {
-            "port": port,
-            "path": path,
-            "url": url,
-            "status": 0,
-            "auth": "down",
-            "bytes": 0,
-            "snippet": str(e)[:120],
-        }
+        # Never send local probes through environment proxies or follow a service's redirects.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        req = urllib.request.Request(url, headers={"User-Agent": "cyber-posture-scan/1.0"})
+        with opener.open(req, timeout=timeout) as response:
+            result["status"] = response.status
+            result["auth"] = "none" if 200 <= response.status < 300 else "unknown"
+    except urllib.error.HTTPError as exc:
+        result["status"] = exc.code
+        result["auth"] = "required" if exc.code in (401, 403) else "unknown"
+        exc.close()
+    except Exception as exc:
+        result["error"] = str(exc)[:200]
+    return result
 
 
-def port_open_on(host: str, port: int, timeout: float = 0.35) -> bool:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        return False
-    s.settimeout(timeout)
-    try:
-        return s.connect_ex((host, port)) == 0
-    except Exception:
-        return False
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-
-def analyze(
-    listeners: list[Listener],
-    probes: list[dict[str, Any]],
-    docker_rows: list[dict[str, str]],
-    ufw: str,
-    lan_ips: list[str],
-) -> list[Finding]:
+def analyze(listeners: list[Listener], probes: list[dict[str, Any]],
+            docker_rows: list[dict[str, str]], ufw: str, lan_ips: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    tcp_all = [l for l in listeners if l.proto == "tcp"]
-    by_port: dict[int, list[Listener]] = {}
-    for l in tcp_all:
-        by_port.setdefault(l.port, []).append(l)
-
-    # UFW
+    allowed = LAN_ALLOWLIST | ACCEPTED_LAN_PORTS
     if ufw == "inactive":
-        findings.append(
-            Finding(
-                "HIGH",
-                "HOST_FW_OFF",
-                "Host firewall (ufw) inactive",
-                "ufw is installed but inactive. Every 0.0.0.0 bind is reachable to the entire LAN (and any compromised IoT/guest device).",
-                remediation="Enable ufw with allow OpenSSH + Tailscale + explicit allowlist; default deny incoming. Do this carefully from console/Tailscale session.",
-            )
-        )
-
-    # Camera / go2rtc unauth on non-loopback
-    for port in (1984, 8554, 8555, 8766, 8767, 8768):
-        ls = by_port.get(port, [])
-        exposed = [l for l in ls if l.bind_class in ("lan_all", "specific", "tailnet", "other")]
-        if not exposed:
+        findings.append(Finding("HIGH", "HOST_FW_OFF", "UFW is inactive",
+                                "Check whether another firewall protects this host.",
+                                remediation="Review inbound rules and restrict services to intended interfaces."))
+    by_port: dict[int, list[Listener]] = {}
+    for listener in listeners:
+        by_port.setdefault(listener.port, []).append(listener)
+    for port, surfaces in sorted(by_port.items()):
+        meta = KNOWN.get(port)
+        wide = [listener for listener in surfaces if listener.bind_class != "loopback"]
+        if meta:
+            expected = meta.get("expect_bind", "loopback")
+            unexpected = [listener for listener in surfaces
+                          if expected != "any" and listener.bind_class != expected]
+            if unexpected:
+                findings.append(Finding("HIGH", "BIND_POLICY_VIOLATION", f"{meta.get('name', port)} violates bind policy",
+                                        f"Expected {expected}; observed " + ", ".join(f"{l.proto} {l.addr}:{port}" for l in unexpected),
+                                        port, "Bind the service to the interfaces specified in its profile."))
+        elif wide and port not in allowed:
+            findings.append(Finding("HIGH", "UNKNOWN_LISTENER", f"Unexpected listener on port {port}",
+                                    ", ".join(f"{l.proto} {l.addr} process={l.process or '?'}" for l in wide),
+                                    port, "Identify the owner; restrict the bind or explicitly document the allowed service."))
+        required = [probe for probe in probes if probe["port"] == port and
+                    probe.get("expected_auth", "required" if (meta or {}).get("auth") == "required" else "observe") == "required"]
+        auth_required = (meta or {}).get("auth") == "required" or bool(required)
+        if not auth_required:
             continue
-        auth = next((p["auth"] for p in probes if p["port"] == port and p["auth"] in ("none", "required")), "unknown")
-        sev = "CRITICAL" if auth == "none" else "HIGH"
-        findings.append(
-            Finding(
-                sev,
-                "CAMERA_SURFACE",
-                f"Camera-related port {port} exposed beyond loopback",
-                f"bind={[l.addr for l in exposed]} auth_probe={auth}. Home-cam / MJPEG / go2rtc must not be world-readable on LAN without auth.",
-                port=port,
-                remediation="Bind camera/streaming UIs to 127.0.0.1; front with an authenticated reverse proxy or Tailscale Serve only if intentional. Enable API auth on go2rtc.",
-            )
-        )
-
-    # LLM unauth
-    for port, name in ((8093, "vLLM"), (11434, "Ollama"), (8082, "Ornith")):
-        ls = by_port.get(port, [])
-        if not ls:
-            continue
-        exposed = [l for l in ls if l.bind_class != "loopback"]
-        auth = next((p["auth"] for p in probes if p["port"] == port and p.get("status")), "unknown")
-        # prefer any probe saying required
-        auths = [p["auth"] for p in probes if p["port"] == port]
-        if "required" in auths:
-            auth = "required"
-        elif "none" in auths:
-            auth = "none"
-        if exposed and auth == "none":
-            findings.append(
-                Finding(
-                    "CRITICAL",
-                    "LLM_UNAUTH",
-                    f"{name} :{port} unauthenticated and non-loopback",
-                    f"Anyone on LAN can burn GPU / pull models / abuse local inference. bind={[l.addr for l in exposed]}",
-                    port=port,
-                    remediation="Require API key at proxy (LiteLLM only public entry), bind engines to 127.0.0.1, or firewall drop from LAN except Tailscale.",
-                )
-            )
-        elif exposed and auth == "required":
-            findings.append(
-                Finding(
-                    "MEDIUM",
-                    "LLM_BOUND_WIDE",
-                    f"{name} :{port} authenticated but wide bind",
-                    f"Auth OK; still prefer loopback + single proxy. bind={[l.addr for l in exposed]}",
-                    port=port,
-                    remediation="Bind to 127.0.0.1; leave only LiteLLM on LAN/tailnet with key.",
-                )
-            )
-
-    # LiteLLM should require auth
-    litellm_auth = [p for p in probes if p["port"] == 4000]
-    if litellm_auth:
-        if any(p["auth"] == "required" for p in litellm_auth):
-            findings.append(
-                Finding(
-                    "INFO",
-                    "LITELLM_AUTH_OK",
-                    "LiteLLM requires API key",
-                    "Unauthenticated /v1/models → 401. Good.",
-                    port=4000,
-                )
-            )
-        elif any(p["auth"] == "none" for p in litellm_auth):
-            findings.append(
-                Finding(
-                    "CRITICAL",
-                    "LITELLM_OPEN",
-                    "LiteLLM accepts unauthenticated requests",
-                    "Proxy is the front door — must enforce keys.",
-                    port=4000,
-                    remediation="Set master key / require virtual keys; reject missing Authorization.",
-                )
-            )
-
-    # Policy: intentional LAN hub (family phones without TS) — file or env
-    # $CYBER_STATE_DIR/accepted-policy.json
-    # {"lan_hub_ok": true, "lan_allow_ports": [22, 9093]}
-    policy_path = STATE_DIR / "accepted-policy.json"
-    policy: dict[str, Any] = {}
-    if policy_path.is_file():
-        try:
-            policy = json.loads(policy_path.read_text(encoding="utf-8"))
-        except Exception:
-            policy = {}
-    lan_hub_ok = bool(policy.get("lan_hub_ok", True))  # default True after 2026-07 hub access restore
-    lan_allow = set(int(x) for x in policy.get("lan_allow_ports", [22, 9093]))
-
-    # Private UIs with no auth on lan_all
-    private_ports = (9093, 9091, 8792, 9500, 9510, 3333, 9090, 13337, 8787, 8793)
-    for port in private_ports:
-        ls = by_port.get(port, [])
-        exposed = [l for l in ls if l.bind_class == "lan_all"]
-        if not exposed:
-            continue
-        if port == 9093 and lan_hub_ok:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "HUB_LAN_ACCEPTED",
-                    "service on 0.0.0.0 (accepted via accepted_lan_ports policy)",
-                    "Intentional: phones on Wi-Fi hit :9093. Mitigations: ufw allow 9093 only + no WAN forward. Prefer Tailscale long-term.",
-                    port=9093,
-                    remediation="When ready: dual-bind lo+TS only + fix ufw tailscale0; enable tailscale serve.",
-                )
-            )
-            continue
-        auths = [p["auth"] for p in probes if p["port"] == port]
-        if "required" in auths:
-            continue
-        if "none" in auths or not auths:
-            meta = KNOWN.get(port, {})
-            sev = "HIGH" if meta.get("tier") in ("private-ui", "camera", "dev", "unknown") else "MEDIUM"
-            findings.append(
-                Finding(
-                    sev,
-                    "PRIVATE_UI_OPEN",
-                    f"Private/dev UI :{port} ({meta.get('name','?')}) open on 0.0.0.0 without auth",
-                    f"LAN clients get HTTP 200 with no credentials. process={[l.process for l in exposed]}",
-                    port=port,
-                    remediation="Bind 127.0.0.1 or Tailscale IP only; add reverse-proxy auth; or ufw allow from tailnet only.",
-                )
-            )
-
-    # NVIDIA DGX dashboard-admin binds a *random* high port on * (uid 0). Detect any lan_all high port while unit active.
-    dgx_admin_active = False
-    try:
-        r = subprocess.run(
-            ["systemctl", "is-active", "dgx-dashboard-admin.service"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        dgx_admin_active = (r.stdout or "").strip() == "active"
-    except Exception:
-        pass
-    vendor_lan_ports = []
-    for port, ls in by_port.items():
-        if port in LAN_ALLOWLIST or port in ACCEPTED_LAN_PORTS or port in KNOWN:
-            # still flag known 37807 via loop below if present
-            if port not in (37807,):
-                continue
-        for l in ls:
-            if l.bind_class == "lan_all" and l.proto == "tcp" and port >= 1024:
-                vendor_lan_ports.append(port)
-    # Fixed known + random
-    for port in (37807, 11000):
-        meta = KNOWN.get(port, {})
-        ls = by_port.get(port, [])
-        exposed = [l for l in ls if l.bind_class == "lan_all"]
-        if not exposed:
-            continue
-        findings.append(
-            Finding(
-                "HIGH",
-                "VENDOR_SURFACE",
-                f"NVIDIA {meta.get('name', port)} :{port} listening beyond loopback",
-                f"Owner={meta.get('owner')}. bind={[l.addr for l in exposed]}.",
-                port=port,
-                remediation=(
-                    f"sudo ufw deny {port}/tcp comment 'dgx-dashboard-admin' "
-                    "OR sudo systemctl disable --now dgx-dashboard-admin.service"
-                ),
-            )
-        )
-    if dgx_admin_active:
-        random_admin = [
-            p
-            for p, ls in by_port.items()
-            if p not in KNOWN
-            and p > 1024
-            and any(l.bind_class == "lan_all" and l.proto == "tcp" for l in ls)
-        ]
-        for port in sorted(set(random_admin))[:5]:
-            findings.append(
-                Finding(
-                    "HIGH",
-                    "VENDOR_SURFACE",
-                    f"Likely NVIDIA dgx-dashboard-admin random port :{port}",
-                    "dgx-dashboard-admin.service is active; random high port on * is its usual pattern.",
-                    port=port,
-                    remediation=(
-                        f"sudo ufw deny {port}/tcp comment 'dgx-dashboard-admin' "
-                        "OR sudo systemctl disable --now dgx-dashboard-admin.service"
-                    ),
-                )
-            )
-
-    # Unexpected high ports lan_all (skip already-flagged vendor)
-    flagged = {f.port for f in findings if f.port}
-    known_ports = set(KNOWN) | {53, 631, 5353, 41641} | lan_allow
-    for port, ls in by_port.items():
-        if port in known_ports or port in flagged:
-            continue
-        if port >= 49152:
-            if all(l.bind_class == "loopback" or l.addr.startswith("100.") for l in ls):
-                continue
-        for l in ls:
-            if l.bind_class == "lan_all" and l.proto == "tcp":
-                findings.append(
-                    Finding(
-                        "MEDIUM",
-                        "UNKNOWN_LISTENER",
-                        f"Unexpected TCP listener :{port} on {l.addr}",
-                        f"process={l.process or '?'} — not in cyber allowlist.",
-                        port=port,
-                        remediation="Identify process; bind loopback or add to known inventory with owner.",
-                    )
-                )
-
-    # Docker publishes to 0.0.0.0
-    wide_docker = []
+        open_paths = [probe for probe in required if 200 <= probe.get("status", 0) < 300]
+        unknown_paths = [probe for probe in required if probe.get("status") not in (401, 403)
+                         and not 200 <= probe.get("status", 0) < 300]
+        if open_paths:
+            findings.append(Finding("CRITICAL" if wide else "HIGH", "AUTH_MISSING", f"Unauthenticated access on port {port}",
+                                    "Protected endpoints returned success without credentials: " + ", ".join(p.get("url", p["path"]) for p in open_paths),
+                                    port, "Require authentication on every protected endpoint; health endpoints may be explicitly public."))
+        if not required or unknown_paths:
+            findings.append(Finding("HIGH", "AUTH_UNVERIFIED", f"Authentication could not be verified on port {port}",
+                                    "No protected probe configured." if not required else
+                                    "; ".join(f"{p.get('url', p['path'])}: status={p.get('status')} {p.get('error', '')}" for p in unknown_paths),
+                                    port, "Configure a protected endpoint and the correct HTTP/TLS scheme for each listening address."))
+        elif not open_paths:
+            findings.append(Finding("INFO", "AUTH_REQUEST_DENIED", f"Unauthenticated probes denied on port {port}",
+                                    "All configured protected HTTP probes returned 401/403; this does not verify the entire application.", port))
     for row in docker_rows:
-        ports = row.get("ports") or ""
-        if "0.0.0.0:" in ports or "[::]:" in ports:
-            wide_docker.append(row["name"])
-    if wide_docker:
-        findings.append(
-            Finding(
-                "MEDIUM",
-                "DOCKER_PUBLISH_ALL",
-                f"Docker published to 0.0.0.0 ({len(wide_docker)} containers)",
-                "containers: " + ", ".join(wide_docker[:20]),
-                remediation="Prefer 127.0.0.1:HOST:CONTAINER publishes; use tailscale serve for remote access.",
-            )
-        )
-
-    # Policy drift vs house-os access model
-    findings.append(
-        Finding(
-            "INFO",
-            "POLICY_NOTE",
-            "Access model vs runtime",
-            "Target: engines/cams loopback; hub may be LAN-open (accepted) behind ufw+router NAT. Prefer Tailscale for phones long-term.",
-            remediation="Track backlog in #cyber-ops weekly review. No WAN port-forwards.",
-        )
-    )
-
-    # LAN reachability confirmation
-    if lan_ips:
-        sample = lan_ips[0]
-        probe_ports = (1984, 8766, 8767, 8768, 8093, 9093, 11434, 4000, 13337, 22)
-        open_lan = [p for p in probe_ports if port_open_on(sample, p)]
-        unexpected = [p for p in open_lan if p not in lan_allow]
-        if unexpected:
-            findings.append(
-                Finding(
-                    "HIGH",
-                    "LAN_REACHABLE",
-                    f"Unexpected ports reachable on LAN IP {sample}",
-                    f"open={open_lan} unexpected={unexpected} allow={sorted(lan_allow)}",
-                    remediation="Host firewall + bind address fixes.",
-                )
-            )
-        elif open_lan:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "LAN_EXPECTED",
-                    f"LAN open ports within allowlist on {sample}",
-                    f"open={open_lan}",
-                )
-            )
-
+        if re.search(r"(?:0\.0\.0\.0|\[?::\]?):\d+->", row.get("ports", "")):
+            findings.append(Finding("HIGH", "DOCKER_PUBLISH_ALL", f"Docker publishes {row['name']} on all interfaces",
+                                    row["ports"], remediation="Bind published ports to loopback or an intended interface and verify access from another device; UFW may not filter Docker forwarding."))
     return findings
 
 
 def fingerprint(findings: list[Finding]) -> str:
     crit = sorted(
-        f"{f.severity}:{f.code}:{f.port}:{f.title}"
+        f"{f.severity}:{f.code}:{f.port}:{f.title}:{f.detail}"
         for f in findings
         if f.severity in ("CRITICAL", "HIGH")
     )
     blob = "\n".join(crit).encode()
     return hashlib.sha256(blob).hexdigest()[:16]
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 def severity_counts(findings: list[Finding]) -> dict[str, int]:
@@ -722,6 +357,7 @@ def to_markdown(result: ScanResult) -> str:
         f"- MEDIUM: {result.summary.get('MEDIUM', 0)}",
         f"- LOW: {result.summary.get('LOW', 0)}",
         f"- INFO: {result.summary.get('INFO', 0)}",
+        f"- Complete: **{result.complete}**",
         f"- Firewall: `{result.ufw}`",
         f"- LAN: {', '.join(result.lan_ips) or '—'}",
         f"- Tailscale: {', '.join(result.tailscale_ips) or '—'}",
@@ -734,12 +370,15 @@ def to_markdown(result: ScanResult) -> str:
         lines += [
             "## Host integrity",
             "",
-            f"- ok: {hi.get('ok')} · mode: `{hi.get('mode')}` · fp `{hi.get('fingerprint')}`",
+            f"- complete: {hi.get('complete')} · mode: `{hi.get('mode')}` · fp `{hi.get('fingerprint')}`",
+            f"- target: {hi.get('checks', {}).get('target', {})}",
             f"- C{hs.get('CRITICAL', 0)} / H{hs.get('HIGH', 0)} / M{hs.get('MEDIUM', 0)}",
             f"- duration: {hi.get('duration_s')}s",
-            f"- detail MD: `wiki/outputs/cyber-posture/host-integrity.md`",
             "",
         ]
+    lines += ["## Coverage", ""]
+    for name, check in {**result.checks, **{f"integrity/{k}": v for k, v in hi.get("coverage", {}).items()}}.items():
+        lines.append(f"- {name}: **{check.get('status')}** {check.get('reason', check.get('error', ''))}")
     lines += [
         "## Findings",
         "",
@@ -755,16 +394,14 @@ def to_markdown(result: ScanResult) -> str:
         if f.get("remediation"):
             lines.append(f"- **fix:** {f['remediation']}")
         lines.append("")
-    lines.append("## Listeners (tcp)")
+    lines.append("## Listeners (TCP and UDP)")
     lines.append("")
-    lines.append("| Port | Addr | Class | Process | Known |")
-    lines.append("|------|------|-------|---------|-------|")
-    tcp = [l for l in result.listeners if l.get("proto") == "tcp"]
-    tcp = sorted(tcp, key=lambda x: (x.get("port") or 0, x.get("addr") or ""))
-    for l in tcp:
+    lines.append("| Protocol | Port | Addr | Class | Process | Known |")
+    lines.append("|----------|------|------|-------|---------|-------|")
+    for l in sorted(result.listeners, key=lambda x: (x.get("port") or 0, x.get("addr") or "")):
         meta = KNOWN.get(l["port"], {})
         lines.append(
-            f"| {l['port']} | `{l['addr']}` | {l['bind_class']} | {l.get('process') or '—'} | {meta.get('name', '—')} |"
+            f"| {l['proto']} | {l['port']} | `{l['addr']}` | {l['bind_class']} | {l.get('process') or '—'} | {meta.get('name', '—')} |"
         )
     lines.append("")
     lines.append("## Docker")
@@ -814,18 +451,20 @@ def to_html(result: ScanResult) -> str:
         )
     rows = []
     for l in sorted(
-        [x for x in result.listeners if x.get("proto") == "tcp"],
+        result.listeners,
         key=lambda x: (x.get("port") or 0, x.get("addr") or ""),
     ):
         meta = KNOWN.get(l["port"], {})
         cls = l.get("bind_class")
         mark = " wide" if cls == "lan_all" else ""
         rows.append(
-            f"<tr class='{mark}'><td class='mono'>{l['port']}</td><td><code>{esc(l['addr'])}</code></td>"
+            f"<tr class='{mark}'><td>{esc(l['proto'])}</td><td class='mono'>{l['port']}</td><td><code>{esc(l['addr'])}</code></td>"
             f"<td>{esc(cls)}</td><td>{esc(l.get('process') or '—')}</td>"
             f"<td>{esc(meta.get('name', '—'))}</td></tr>"
         )
     summary = result.summary
+    coverage = "".join(f"<li>{esc(name)}: <strong>{esc(str(check.get('status')))}</strong> {esc(str(check.get('reason', check.get('error', ''))))}</li>"
+                       for name, check in {**result.checks, **{f"integrity/{k}": v for k, v in result.host_integrity.get("coverage", {}).items()}}.items())
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -910,6 +549,7 @@ tr.wide td {{ background:rgba(255,92,92,.06); }}
   </div>
 </header>
 <main>
+  <section class="panel"><div class="pbd"><strong>Scan {'complete' if result.complete else 'INCOMPLETE'}</strong><p>{esc(str(result.host_integrity.get('checks', {}).get('target', {})))}</p><ul>{coverage}</ul></div></section>
   <div class="kpis">
     <div class="kpi red"><div class="lab">Critical</div><div class="val" style="color:var(--red)">{summary.get('CRITICAL',0)}</div></div>
     <div class="kpi amber"><div class="lab">High</div><div class="val" style="color:var(--amber)">{summary.get('HIGH',0)}</div></div>
@@ -925,15 +565,15 @@ tr.wide td {{ background:rgba(255,92,92,.06); }}
     <div class="pbd">{''.join(cards) if cards else '<p class="note">No findings.</p>'}</div>
   </section>
   <section class="panel">
-    <div class="phd"><h2>TCP listeners</h2><span class="mono" style="color:var(--dim);font-size:.7rem">wide binds highlighted</span></div>
+    <div class="phd"><h2>TCP and UDP listeners</h2><span class="mono" style="color:var(--dim);font-size:.7rem">wide binds highlighted</span></div>
     <div class="pbd" style="overflow:auto">
       <table>
-        <thead><tr><th>Port</th><th>Addr</th><th>Class</th><th>Process</th><th>Known</th></tr></thead>
+        <thead><tr><th>Protocol</th><th>Port</th><th>Addr</th><th>Class</th><th>Process</th><th>Known</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
     </div>
   </section>
-  <p class="foot">Scanner: cyber-posture-scan.py + cyber-host-integrity-scan.py · MC skin aligned with OPS · no secrets in report</p>
+  <p class="foot">Scanner: cyber-posture-scan.py + cyber-host-integrity-scan.py · MC skin aligned with OPS · treat reports as sensitive</p>
 </main>
 </body>
 </html>
@@ -966,235 +606,175 @@ def discord_alert(result: ScanResult, prev_fp: str | None) -> str:
 
 
 def run_host_integrity_quick() -> dict[str, Any]:
-    """Merge quick host IoC/malware surface into exposure scan (no deep AV)."""
-    # Portable: sibling scan_integrity.py, then Hermes script fallback
-    here = Path(__file__).resolve().parent
-    script = here / "scan_integrity.py"
-    if not script.is_file():
-        script = Path(__file__).resolve().parent / "scan_integrity.py"
-        if not script.is_file():
-            script = HOME / ".local/bin/cyber-host-integrity-scan.py"
-    if not script.is_file():
-        return {"ok": False, "error": "integrity script missing"}
-    out_json = STATE_DIR / "host-integrity" / "last-quick.json"
-    deep_json = STATE_DIR / "host-integrity" / "last-deep.json"
+    from cyber_posture import scan_integrity
     try:
-        p = subprocess.run(
-            [os.environ.get("PYTHON", "python3"), str(script), "--json", str(out_json)],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        data = load_json(out_json)
-        if not isinstance(data, dict):
-            return {
-                "ok": False,
-                "error": f"integrity scan rc={p.returncode}",
-                "stderr": (p.stderr or "")[:300],
-            }
-        data["ok"] = True
-        data["merged"] = True
-        # Fold residual HIGH from last deep run (clam/rkhunter/debsums) without re-running 3min
-        deep = load_json(deep_json)
-        if isinstance(deep, dict) and deep.get("findings"):
-            data["deep_fingerprint"] = deep.get("fingerprint")
-            data["deep_ts"] = deep.get("ts")
-            data["deep_summary"] = deep.get("summary")
-            existing = {(f.get("code"), f.get("title")) for f in (data.get("findings") or [])}
-            extra = []
-            for f in deep.get("findings") or []:
-                if f.get("severity") not in ("CRITICAL", "HIGH"):
-                    continue
-                key = (f.get("code"), f.get("title"))
-                if key in existing:
-                    continue
-                extra.append(f)
-                existing.add(key)
-            if extra:
-                data.setdefault("findings", []).extend(extra)
-                # recompute light summary bump
-                summ = dict(data.get("summary") or {})
-                for f in extra:
-                    sev = f.get("severity") or "INFO"
-                    summ[sev] = int(summ.get(sev) or 0) + 1
-                data["summary"] = summ
-                data["deep_merged_n"] = len(extra)
-        return data
-    except Exception as e:
-        data = load_json(out_json) or load_json(deep_json)
-        if isinstance(data, dict):
-            data["ok"] = True
-            data["stale"] = True
-            data["merge_error"] = str(e)
-            return data
-        return {"ok": False, "error": str(e)}
+        data = asdict(scan_integrity.scan())
+    except Exception as exc:
+        return {"complete": False, "error": str(exc)}
+    # Keep unresolved deep-tool findings visible, with their original date and coverage.
+    deep_path = STATE_DIR / "host-integrity/last-deep.json"
+    if deep_path.exists():
+        deep = load_json(deep_path) or {}
+        same_host = deep.get("host") == data["host"]
+        valid = type(deep.get("complete")) is bool and deep.get("mode") == "deep" and same_host
+        saved_findings = deep.get("findings")
+        if not isinstance(saved_findings, list):
+            saved_findings = []
+            valid = False
+        usable_findings = []
+        for raw in saved_findings:
+            try:
+                finding = scan_integrity.Finding(**raw)
+                if (finding.severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+                        or not all(isinstance(value, str) for value in asdict(finding).values())):
+                    raise ValueError("Invalid saved finding")
+                usable_findings.append(asdict(finding))
+            except (TypeError, ValueError):
+                valid = False
+        try:
+            age = (datetime.now(TZ) - datetime.fromisoformat(deep["ts"])).total_seconds()
+            fresh = 0 <= age <= 8 * 86400
+        except (KeyError, TypeError, ValueError):
+            fresh = False
+        completed = valid and fresh and deep["complete"]
+        data["checks"]["last_deep"] = {"status": "passed" if completed else "failed", "ts": deep.get("ts")}
+        if not valid:
+            data["checks"]["last_deep"]["reason"] = "Saved deep report is invalid or belongs to a different host."
+        data["coverage"]["last_deep"] = data["checks"]["last_deep"]
+        if not completed:
+            data["complete"] = False
+            data["findings"].append(asdict(scan_integrity.Finding("HIGH", "DEEP_SCAN_INCOMPLETE", "Latest deep scan is stale or incomplete",
+                                      f"Last deep scan: {deep.get('ts', 'unknown')}. " + data["checks"]["last_deep"].get("reason", ""),
+                                      "Run integrity --deep and resolve failed checks.")))
+        existing = {(f["code"], f["title"]) for f in data["findings"]}
+        for finding in usable_findings if same_host else []:
+            if finding.get("severity") in ("CRITICAL", "HIGH") and str(finding.get("code", "")).startswith(("CLAM", "RKHUNTER", "CHKROOT", "DEBSUMS")) and (finding["code"], finding["title"]) not in existing:
+                data["findings"].append({**finding, "detail": f"Last deep scan ({deep.get('ts')}): {finding.get('detail', '')}"})
+        native_findings = [scan_integrity.Finding(**f) for f in data["findings"]]
+        data["summary"] = scan_integrity.severity_counts(native_findings)
+        data["fingerprint"] = scan_integrity.fingerprint(native_findings)
+    return data
 
 
-def merge_integrity_findings(
-    findings: list[Finding], integrity: dict[str, Any]
-) -> list[Finding]:
-    """Fold host-integrity HIGH+ into exposure findings (dedupe by code+title)."""
-    if not integrity.get("ok"):
-        findings.append(
-            Finding(
-                "LOW",
-                "HOST_INTEGRITY_UNAVAILABLE",
-                "Host integrity scan unavailable",
-                integrity.get("error") or "no data",
-                remediation="Run cyber-host-integrity-scan.py; ensure script present.",
-            )
-        )
-        return findings
-    seen = {(f.code, f.title) for f in findings}
-    for raw in integrity.get("findings") or []:
-        sev = raw.get("severity") or "INFO"
-        # Always surface CRITICAL/HIGH; MEDIUM malware-ish codes too
-        code = raw.get("code") or "HOST_IOC"
-        if sev not in ("CRITICAL", "HIGH") and not (
-            sev == "MEDIUM"
-            and str(code).startswith(
-                ("TMP_", "IOC_", "CLAM", "DEBSUMS", "RKHUNTER", "CHKROOT", "SUSPICIOUS", "NET_MINER")
-            )
-        ):
-            continue
-        title = raw.get("title") or code
-        key = (code, title)
-        if key in seen:
-            continue
-        seen.add(key)
-        findings.append(
-            Finding(
-                sev,
-                code if str(code).startswith(("IOC_", "CLAM", "TMP_", "SSH_", "CRON", "SYSTEMD", "PATH_", "SUSPICIOUS", "DEBSUMS", "RKHUNTER", "CHKROOT", "HOST_", "MALWARE", "NET_", "PROC_")) else f"HOST_{code}",
-                title,
-                raw.get("detail") or "",
-                remediation=raw.get("remediation") or "",
-            )
-        )
-    # INFO if integrity clean
-    summ = integrity.get("summary") or {}
-    if int(summ.get("CRITICAL") or 0) == 0 and int(summ.get("HIGH") or 0) == 0:
-        findings.append(
-            Finding(
-                "INFO",
-                "HOST_INTEGRITY_OK",
-                "Host integrity quick scan: no CRITICAL/HIGH",
-                f"mode={integrity.get('mode')} fp={integrity.get('fingerprint')} "
-                f"duration={integrity.get('duration_s')}s — IoC/persistence checks only; "
-                "install ClamAV/rkhunter for signature+rootkit depth.",
-            )
-        )
+def merge_integrity_findings(findings: list[Finding], integrity: dict[str, Any]) -> list[Finding]:
+    if not integrity.get("complete"):
+        findings.append(Finding("HIGH", "HOST_INTEGRITY_INCOMPLETE", "Host integrity coverage is incomplete",
+                                integrity.get("error") or "Review failed/skipped checks in the host integrity coverage report.",
+                                remediation="Run native integrity checks on the host and resolve missing permissions/tools."))
+    for raw in integrity.get("findings", []):
+        findings.append(Finding(raw["severity"], raw["code"], raw["title"], raw.get("detail", ""),
+                                remediation=raw.get("remediation", "")))
+    if integrity.get("complete") and not any(integrity.get("summary", {}).get(s, 0) for s in ("CRITICAL", "HIGH")):
+        findings.append(Finding("INFO", "HOST_INTEGRITY_OK", "Completed integrity checks found no CRITICAL/HIGH findings",
+                                "Coverage is limited to the checks and target scope listed in this report."))
     return findings
 
 
 def scan() -> ScanResult:
-    host = run(["hostname"]).strip() or "localhost"
-    lan, ts = lan_and_tail_ips()
-    listeners = parse_ss()
-    docker_rows = docker_ps()
-    ufw = ufw_status()
+    apply_profile()
+    findings: list[Finding] = []
+    checks: dict[str, Any] = {}
 
-    # probes only for listening tcp ports we care about
-    listening_ports = {l.port for l in listeners if l.proto == "tcp"}
-    probes: list[dict[str, Any]] = []
-    for port, paths in PROBES.items():
-        if port not in listening_ports:
+    def collect(name, collector, fallback):
+        try:
+            result = collector()
+            checks[name] = {"status": "passed"}
+            return result
+        except Exception as exc:
+            checks[name] = {"status": "failed", "error": str(exc)[:300]}
+            findings.append(Finding("HIGH", "COLLECTOR_FAILED", f"{name} collection failed", str(exc)[:300],
+                                    remediation="Restore the required command, permissions, or service; rerun the scan."))
+            return fallback
+
+    lan, tail = collect("addresses", lan_and_tail_ips, ([], []))
+    TAILNET_IPS.clear()
+    TAILNET_IPS.update(ip.split("%")[0] for ip in tail)
+    listeners = collect("listeners", parse_ss, [])
+    if shutil.which("docker"):
+        docker_rows = collect("docker", docker_ps, [])
+    else:
+        docker_rows = []
+        checks["docker"] = {"status": "skipped", "reason": "Docker CLI unavailable; published ports were not inspected."}
+    published = collect("docker_publishes", lambda: docker_listeners(docker_rows), []) if docker_rows else []
+    seen_listeners = {(listener.proto, listener.addr, listener.port) for listener in listeners}
+    listeners.extend(listener for listener in published if (listener.proto, listener.addr, listener.port) not in seen_listeners)
+    if host_root() != Path("/"):
+        ufw = "unknown-host-runtime"
+    else:
+        ufw = collect("firewall", ufw_status, "unknown")
+    if ufw.startswith("unknown"):
+        checks["firewall"] = {"status": "failed", "reason": "Host firewall runtime could not be verified."}
+        findings.append(Finding("HIGH", "FIREWALL_UNVERIFIED", "Host firewall runtime is unverified", ufw,
+                                remediation="Inspect the host's actual firewall rules; a container's configuration is not host evidence."))
+    probes = []
+    seen = set()
+    for listener in listeners:
+        if listener.proto != "tcp":
             continue
-        for path in paths:
-            probes.append(http_probe(port, path))
-
-    findings = analyze(listeners, probes, docker_rows, ufw, lan)
+        host = listener.addr
+        if listener.bind_class == "lan_all":
+            host = "::1" if ":" in host else "127.0.0.1"
+        for spec in PROBES.get(listener.port, []):
+            identity = (host, listener.port, spec["path"], spec["scheme"])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            probes.append({**http_probe(listener.port, spec["path"], host=host, scheme=spec["scheme"]), "expected_auth": spec["auth"]})
+    findings.extend(analyze(listeners, probes, docker_rows, ufw, lan))
+    if any(f.code == "AUTH_UNVERIFIED" for f in findings):
+        checks["auth_probes"] = {"status": "failed", "reason": "One or more required authentication checks are unverified."}
+    else:
+        checks["auth_probes"] = {"status": "passed" if probes else "skipped"}
     integrity = run_host_integrity_quick()
     findings = merge_integrity_findings(findings, integrity)
-    counts = severity_counts(findings)
-    fp = fingerprint(findings)
-    # compact integrity blob for OPS (no full checks dump in last-scan if huge)
-    integrity_pub = {
-        "ok": integrity.get("ok"),
-        "ts": integrity.get("ts"),
-        "mode": integrity.get("mode"),
-        "fingerprint": integrity.get("fingerprint"),
-        "summary": integrity.get("summary") or {},
-        "duration_s": integrity.get("duration_s"),
-        "tools": {
-            k: {"present": v.get("present")}
-            for k, v in (integrity.get("tools") or {}).items()
-            if isinstance(v, dict) and "present" in v
-        },
-        "stale": integrity.get("stale"),
-        "error": integrity.get("error"),
-    }
-    return ScanResult(
-        ts=datetime.now(TZ).strftime("%Y-%m-%d %H:%M %Z"),
-        host=host,
-        lan_ips=lan,
-        tailscale_ips=ts,
-        listeners=[asdict(l) for l in listeners],
-        probes=probes,
-        findings=[asdict(f) for f in findings],
-        docker=docker_rows,
-        ufw=ufw,
-        summary=counts,
-        fingerprint=fp,
-        host_integrity=integrity_pub,
-    )
+    return ScanResult(ts=datetime.now(TZ).isoformat(timespec="seconds"), host=target_hostname(),
+                      lan_ips=lan, tailscale_ips=tail, listeners=[asdict(l) for l in listeners], probes=probes,
+                      findings=[asdict(f) for f in findings], docker=docker_rows, ufw=ufw,
+                      summary=severity_counts(findings), fingerprint=fingerprint(findings), host_integrity=integrity,
+                      checks=checks, complete=bool(integrity.get("complete")) and not any(c["status"] == "failed" for c in checks.values()))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quiet", action="store_true", help="cron silent unless HIGH+ attention")
-    ap.add_argument("--full", action="store_true")
-    ap.add_argument("--json", type=Path, default=None)
-    ap.add_argument("--md", type=Path, default=None)
-    ap.add_argument("--html", type=Path, default=None)
+    ap.add_argument("--quiet", action="store_true", help="alert on HIGH+ changes, recovery, or a daily reminder")
+    ap.add_argument("--full", action="store_true", help="force a quiet-mode notification")
+    ap.add_argument("--json", type=Path)
+    ap.add_argument("--md", type=Path)
+    ap.add_argument("--html", type=Path)
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args()
-
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    result = scan()
-
-    json_path = args.json or DEFAULT_JSON
-    md_path = args.md or DEFAULT_MD
-    html_path = args.html or DEFAULT_HTML
-
-    if not args.no_write:
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        html_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = asdict(result)
-        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        md_path.write_text(to_markdown(result), encoding="utf-8")
-        html_path.write_text(to_html(result), encoding="utf-8")
-        # dated copy
-        dated = md_path.parent / f"{datetime.now(TZ).strftime('%Y-%m-%d')}.md"
-        dated.write_text(to_markdown(result), encoding="utf-8")
-
-    prev = load_json(BASELINE_PATH) or load_json(LAST_PATH)
-    prev_fp = (prev or {}).get("fingerprint")
-
-    if args.update_baseline:
-        BASELINE_PATH.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
-
-    crit = result.summary.get("CRITICAL", 0)
-    high = result.summary.get("HIGH", 0)
-    attention = crit > 0 or high > 0
-    fp_changed = prev_fp is not None and prev_fp != result.fingerprint
-
-    # Always write last-scan already done. Quiet mode for cron:
-    if args.quiet:
-        # Delta-based: known CRITICAL/HIGH from baseline do not re-spam.
-        # Alert when: no baseline yet, fingerprint changed, or --full forced path.
-        if prev_fp is None or fp_changed:
-            print(discord_alert(result, prev_fp))
-            return 0
-        return 0
-
-    # Human mode
-    print(to_markdown(result))
-    if attention:
-        print("\n---\n" + discord_alert(result, prev_fp))
-    return 0
+    if args.no_write and args.update_baseline:
+        ap.error("--no-write cannot be combined with --update-baseline")
+    try:
+        with nullcontext() if args.no_write else scan_lock(STATE_DIR, "exposure"):
+            alert_path = STATE_DIR / "last-alert.json"
+            previous = load_json(alert_path)
+            result = scan()
+            if args.update_baseline and (not result.complete or result.summary.get("CRITICAL", 0)):
+                raise ValueError("Refusing to baseline an incomplete scan or CRITICAL findings")
+            if not args.no_write:
+                raw = json.dumps(asdict(result), indent=2)
+                atomic_write(args.json or DEFAULT_JSON, raw)
+                if args.json and args.json != LAST_PATH:
+                    atomic_write(LAST_PATH, raw)
+                atomic_write(args.md or DEFAULT_MD, to_markdown(result))
+                atomic_write(args.html or DEFAULT_HTML, to_html(result))
+                dated = (args.md or DEFAULT_MD).parent / f"{datetime.now(TZ):%Y-%m-%d}.md"
+                atomic_write(dated, to_markdown(result))
+                if args.update_baseline:
+                    atomic_write(BASELINE_PATH, raw)
+            notify = needs_alert(result, previous, args.full)
+            if not args.quiet:
+                print(to_markdown(result))
+            if notify:
+                print(discord_alert(result, (previous or {}).get("fingerprint")))
+                if not args.no_write:
+                    remember_alert(alert_path, result)
+            return 0 if result.complete else 2
+    except Exception as exc:
+        print(f"cyber-posture scan failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

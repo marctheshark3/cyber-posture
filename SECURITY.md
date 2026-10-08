@@ -12,4 +12,6 @@ If you find a vulnerability in **cyber-posture** itself, open a GitHub Security 
 
 ## Supply chain
 
-Release images are built on GitHub Actions and published to GHCR. Prefer pinned version tags over `edge` in production.
+Release images are built on GitHub Actions and published to GHCR. Prefer verified image digests for deployment. Workflow actions are pinned to reviewed commit SHAs and releases require the regression suite. Review dependency updates regularly.
+
+New report/state files use mode 0600 and atomic replacement; new managed directories use 0700. Existing historical files and directories need separate permission review. Local state is not tamper-proof against the account running the scanner. Send important alerts to an independently protected system.

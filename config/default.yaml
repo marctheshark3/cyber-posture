@@ -33,8 +33,10 @@ known_services:
     tier: system
 
 probes:
-  80: ["/", "/health"]
-  443: ["/", "/health"]
+  80:
+    - {path: /, scheme: http, auth: observe}
+  443:
+    - {path: /, scheme: https, auth: observe}
 
 tmp_allow_prefixes:
   - /tmp/.X11-unix

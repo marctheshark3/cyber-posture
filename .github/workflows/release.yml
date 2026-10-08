@@ -12,10 +12,7 @@ on:
         default: ""
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -26,39 +23,59 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install profile parser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
+      - run: make test
+
   release:
+    needs: checks
+    permissions:
+      contents: write
+      packages: write
     name: Build · Push · GitHub Release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Resolve version
         id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
-            V="${{ inputs.tag }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "$INPUT_TAG" ]]; then
+            V="$INPUT_TAG"
             V="${V#v}"
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             V="${GITHUB_REF_NAME#v}"
           else
             V="$(tr -d '[:space:]' < VERSION)-sha.${GITHUB_SHA::7}"
           fi
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "Invalid release version" >&2
+            exit 1
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $V"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -66,7 +83,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -82,7 +99,7 @@ jobs:
 
       - name: Build and push multi-arch
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -97,9 +114,13 @@ jobs:
       - name: Generate release notes
         id: notes
         if: github.ref_type == 'tag' || inputs.tag != ''
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          V="${{ steps.ver.outputs.version }}"
-          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          V="$RELEASE_VERSION"
+          IMG="$RELEASE_IMAGE"
           cat > /tmp/release-notes.md <<EOF
           ## cyber-posture v${V}
 
@@ -114,19 +135,11 @@ jobs:
 
           Platforms: \`linux/amd64\`, \`linux/arm64\`
 
-          ### Host scan (recommended)
+          ### Container host evidence (partial coverage)
 
-          \`\`\`bash
-          ./scripts/docker-run-host.sh scan
-          ./scripts/docker-run-host.sh integrity --deep
-          # or:
-          docker run --rm --net=host --pid=host --user 0:0 \\
-            -v cyber-state:/var/lib/cyber-posture \\
-            -v \$HOME/.config/cyber-posture:/etc/cyber-posture \\
-            -v /etc:/host/etc:ro \\
-            -e HOST_ROOT=/host \\
-            ${IMG}:${V} scan
-          \`\`\`
+          Use the checked-in docker-run-host.sh helper. It drops capabilities, uses
+          read-only host mounts, and omits the Docker socket. Host user persistence,
+          package integrity and firewall runtime require native inspection.
 
           ### Native install
 
@@ -139,12 +152,12 @@ jobs:
 
           ### Digest
 
-          Image digest: \`${{ steps.build.outputs.digest }}\`
+          Image digest: \`${RELEASE_DIGEST}\`
           EOF
 
       - name: Create GitHub Release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           body_path: /tmp/release-notes.md
@@ -152,6 +165,7 @@ jobs:
 
   # Fast single-arch publish on main for continuous latest-dev
   publish-main:
+    needs: checks
     name: Publish main → :edge
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -159,18 +173,18 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
@@ -178,7 +192,7 @@ jobs:
             type=raw,value=edge
             type=sha,prefix=sha-,format=short
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64

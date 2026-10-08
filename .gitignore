@@ -7,13 +7,17 @@ venv/
 
 # Local state & reports (never push scan dumps)
 .state/
+state/
 reports/
 *.json.bak
 
 # User secrets / machine local
 .env
+.env.*
 config/local.yaml
 config/local.yml
+config/local/
+config/profiles/local/
 .authorized_keys_snapshot
 
 # OS

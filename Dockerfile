@@ -52,7 +52,8 @@ RUN chmod -R a+rX /opt/cyber-posture \
 
 # Non-root default; host scans often need --user root + host ns
 RUN useradd -m -u 10001 -s /bin/bash cyber \
-    && chown -R cyber:cyber /var/lib/cyber-posture
+    && chown -R cyber:cyber /var/lib/cyber-posture \
+    && chmod 0700 /var/lib/cyber-posture /var/lib/cyber-posture/reports /var/lib/cyber-posture/host-integrity
 USER cyber
 
 VOLUME ["/var/lib/cyber-posture", "/etc/cyber-posture"]
